@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TeleVault</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="TeleVault">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <meta name="theme-color" content="#08080c">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #08080c;
+      --surface: #111118;
+      --surface2: #1a1a24;
+      --border: #222233;
+      --text: #e8e8f0;
+      --text2: #8888a0;
+      --accent: #6c5ce7;
+      --accent2: #a29bfe;
+      --accent-glow: rgba(108,92,231,.15);
+      --radius: 16px;
+      --radius-sm: 10px;
+      --transition: .2s cubic-bezier(.4,0,.2,1);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ─── Sidebar ─── */
+    .layout { display: flex; min-height: 100vh; }
+
+    .sidebar {
+      width: 260px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 24px 16px;
+      position: fixed;
+      top: 0; left: 0; bottom: 0;
+      overflow-y: auto;
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      transition: transform var(--transition);
+    }
+
+    .logo {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -.5px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 28px;
+      padding: 0 4px;
+    }
+
+    .logo-icon {
+      width: 32px; height: 32px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+
+    .sidebar h3 {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: var(--text2);
+      padding: 0 8px;
+      margin: 20px 0 8px;
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      color: var(--text2);
+      font-size: 13px;
+      font-weight: 500;
+      transition: all var(--transition);
+      user-select: none;
+    }
+
+    .nav-item:hover { background: var(--surface2); color: var(--text); }
+    .nav-item.active { background: var(--accent-glow); color: var(--accent2); }
+    .nav-item .count {
+      margin-left: auto;
+      font-size: 11px;
+      background: var(--surface2);
+      padding: 2px 8px;
+      border-radius: 20px;
+      color: var(--text2);
+    }
+    .nav-item.active .count { background: rgba(108,92,231,.2); color: var(--accent2); }
+
+    .sidebar-stats {
+      padding: 16px 12px;
+      background: var(--surface2);
+      border-radius: var(--radius-sm);
+      margin-top: auto;
+    }
+
+    .stat-row { display: flex; justify-content: space-between; font-size: 12px; padding: 4px 0; }
+    .stat-label { color: var(--text2); }
+    .stat-value { font-weight: 600; }
+
+    #sourceList { max-height: 280px; overflow-y: auto; }
+
+    /* ─── Main ─── */
+    .main {
+      flex: 1;
+      margin-left: 260px;
+      transition: margin-left var(--transition);
+    }
+
+    /* ─── Top Bar ─── */
+    .topbar {
+      position: sticky;
+      top: 0; z-index: 15;
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      backdrop-filter: blur(20px);
+      background: rgba(8,8,12,.85);
+    }
+
+    .menu-btn {
+      display: none;
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 18px;
+      line-height: 1;
+    }
+
+    .search-wrap { flex: 1; position: relative; max-width: 480px; }
+
+    .search-wrap svg {
+      position: absolute; left: 14px; top: 50%;
+      transform: translateY(-50%);
+      color: var(--text2);
+      width: 16px; height: 16px;
+    }
+
+    .search-input {
+      width: 100%;
+      padding: 10px 14px 10px 40px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 14px;
+      font-family: inherit;
+      outline: none;
+      transition: all var(--transition);
+    }
+
+    .search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+    .search-input::placeholder { color: var(--text2); }
+
+    .topbar-info { font-size: 12px; color: var(--text2); white-space: nowrap; }
+
+    /* ─── Grid ─── */
+    .content { padding: 20px 24px; }
+
+    .grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(3, 1fr);
+    }
+
+    @media (max-width: 1200px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 600px)  { .grid { grid-template-columns: 1fr; gap: 8px; } }
+
+    .card {
+      position: relative;
+      border-radius: var(--radius);
+      overflow: hidden;
+      cursor: pointer;
+      background: var(--surface);
+      aspect-ratio: 4/3;
+      transition: transform var(--transition), box-shadow var(--transition);
+    }
+
+    .card:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 12px 40px rgba(0,0,0,.5);
+      z-index: 2;
+    }
+
+    .card img {
+      width: 100%; height: 100%;
+      object-fit: cover;
+      display: block;
+      transition: transform .4s ease;
+    }
+
+    .card:hover img { transform: scale(1.04); }
+
+    .card-overlay {
+      position: absolute; inset: 0;
+      background: linear-gradient(transparent 40%, rgba(0,0,0,.75));
+      opacity: 0;
+      transition: opacity var(--transition);
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      padding: 16px;
+    }
+
+    .card:hover .card-overlay { opacity: 1; }
+
+    .card-title {
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #fff;
+    }
+
+    .card-sub { font-size: 11px; color: rgba(255,255,255,.55); margin-top: 3px; }
+
+    .card-badge {
+      position: absolute;
+      top: 10px; right: 10px;
+      background: rgba(0,0,0,.55);
+      backdrop-filter: blur(6px);
+      color: #fff;
+      font-size: 10px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-weight: 600;
+      letter-spacing: .5px;
+    }
+
+    .play-badge {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%,-50%);
+      width: 56px; height: 56px;
+      background: rgba(0,0,0,.45);
+      backdrop-filter: blur(10px);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      opacity: .9;
+      transition: all var(--transition);
+    }
+
+    .card:hover .play-badge { opacity: 1; transform: translate(-50%,-50%) scale(1.1); background: var(--accent); }
+    .play-badge svg { width: 22px; height: 22px; fill: #fff; margin-left: 3px; }
+
+    /* ─── Load More ─── */
+    .load-trigger { height: 1px; }
+
+    .loading-spinner {
+      display: flex;
+      justify-content: center;
+      padding: 32px;
+    }
+
+    .loading-spinner::after {
+      content: '';
+      width: 28px; height: 28px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ─── Viewer / Lightbox ─── */
+    .viewer {
+      position: fixed; inset: 0;
+      z-index: 100;
+      background: rgba(0,0,0,.95);
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+    }
+
+    .viewer.active { display: flex; }
+
+    .viewer-close {
+      position: fixed;
+      top: 16px; right: 16px;
+      background: rgba(255,255,255,.08);
+      border: none;
+      color: #fff;
+      width: 44px; height: 44px;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 20px;
+      display: flex; align-items: center; justify-content: center;
+      transition: background var(--transition);
+      z-index: 102;
+    }
+
+    .viewer-close:hover { background: rgba(255,255,255,.18); }
+
+    .viewer-stage {
+      position: relative;
+      width: 100%; height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    /* Thumbnail placeholder — shown instantly */
+    .viewer-thumb {
+      position: absolute;
+      max-width: 90vw; max-height: 85vh;
+      object-fit: contain;
+      border-radius: 6px;
+      filter: blur(8px);
+      transform: scale(1.02);
+      transition: opacity .3s ease;
+      z-index: 1;
+    }
+
+    /* Full-res image — loads on top, fades in */
+    .viewer-full {
+      position: absolute;
+      max-width: 90vw; max-height: 85vh;
+      object-fit: contain;
+      border-radius: 6px;
+      opacity: 0;
+      transition: opacity .3s ease;
+      z-index: 2;
+    }
+
+    .viewer-full.loaded { opacity: 1; }
+    .viewer-full.loaded + .viewer-thumb,
+    .viewer-thumb.hide { opacity: 0; }
+
+    .viewer-video {
+      max-width: 90vw; max-height: 85vh;
+      border-radius: 6px;
+      z-index: 2;
+    }
+
+    .viewer-meta {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      text-align: center;
+      color: var(--text2);
+      font-size: 13px;
+      padding: 16px 20px;
+      background: linear-gradient(transparent, rgba(0,0,0,.7));
+      z-index: 101;
+    }
+
+    .viewer-meta a { color: var(--accent2); text-decoration: none; }
+    .viewer-meta a:hover { text-decoration: underline; }
+
+    .viewer-nav {
+      position: fixed;
+      top: 50%; transform: translateY(-50%);
+      background: rgba(255,255,255,.06);
+      border: none;
+      color: #fff;
+      width: 48px; height: 48px;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 22px;
+      display: flex; align-items: center; justify-content: center;
+      transition: background var(--transition);
+      z-index: 102;
+    }
+
+    .viewer-nav:hover { background: rgba(255,255,255,.14); }
+    .viewer-nav.prev { left: 16px; }
+    .viewer-nav.next { right: 16px; }
+
+    /* ─── Preload next image (hidden) ─── */
+    .preload { display: none; }
+
+    /* ─── Empty ─── */
+    .empty { text-align: center; padding: 80px 20px; color: var(--text2); }
+    .empty-icon { font-size: 48px; margin-bottom: 16px; }
+    .empty h2 { font-size: 18px; color: var(--text); margin-bottom: 8px; }
+
+    /* ─── Responsive ─── */
+    @media (max-width: 768px) {
+      .sidebar { transform: translateX(-100%); }
+      .sidebar.visible { transform: translateX(0); }
+      .main { margin-left: 0 !important; }
+      .menu-btn { display: block; }
+      .viewer-nav { width: 36px; height: 36px; font-size: 18px; }
+      .viewer-nav.prev { left: 6px; }
+      .viewer-nav.next { right: 6px; }
+    }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="logo">
+      <div class="logo-icon">◆</div>
+      TeleVault
+    </div>
+    <div class="nav-item active" data-filter="all">
+      <span>🏠</span> All Media <span class="count" id="totalCount">—</span>
+    </div>
+    <div class="nav-item" data-filter="photo">
+      <span>🖼️</span> Photos <span class="count" id="photoCount">—</span>
+    </div>
+    <div class="nav-item" data-filter="video">
+      <span>🎬</span> Videos <span class="count" id="videoCount">—</span>
+    </div>
+    <div class="nav-item" data-filter="animation">
+      <span>✨</span> GIFs <span class="count" id="animCount">—</span>
+    </div>
+    <h3>Sources</h3>
+    <div id="sourceList"></div>
+    <div class="sidebar-stats">
+      <div class="stat-row">
+        <span class="stat-label">Status</span>
+        <span class="stat-value" id="statStatus">Loading…</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Total Size</span>
+        <span class="stat-value" id="statSize">—</span>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main" id="main">
+    <div class="topbar">
+      <button class="menu-btn" id="menuBtn">☰</button>
+      <div class="search-wrap">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        <input class="search-input" id="search" placeholder="Search media…" autocomplete="off">
+      </div>
+      <div class="topbar-info" id="topInfo"></div>
+    </div>
+    <div class="content">
+      <div class="grid" id="grid"></div>
+      <div class="loading-spinner" id="spinner" style="display:none"></div>
+      <div class="load-trigger" id="loadTrigger"></div>
+      <div class="empty" id="empty" style="display:none">
+        <div class="empty-icon">📭</div>
+        <h2>No media found</h2>
+        <p>Try a different search or filter</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="viewer" id="viewer">
+  <button class="viewer-close" id="viewerClose">✕</button>
+  <button class="viewer-nav prev" id="prevBtn">‹</button>
+  <button class="viewer-nav next" id="nextBtn">›</button>
+  <div class="viewer-stage" id="viewerStage"></div>
+  <div class="viewer-meta" id="viewerMeta"></div>
+</div>
+
+<!-- Preload container -->
+<div class="preload" id="preload"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+
+let allItems = [];
+let filtered = [];
+let currentFilter = 'all';
+let currentSource = '';
+let currentSearch = '';
+let viewerIdx = -1;
+
+// ─── Pagination ───
+const PAGE_SIZE = 24;
+let renderedCount = 0;
+let loading = false;
+
+// ─── Thumbnail cache (blob URLs) ───
+const thumbCache = {};
+
+async function fetchData() {
+  const r = await fetch('/api/media');
+  const d = await r.json();
+  allItems = d.items || [];
+
+  const types = {};
+  const sources = {};
+  let totalSize = 0;
+  allItems.forEach(i => {
+    types[i.type] = (types[i.type] || 0) + 1;
+    if (i.album) sources[i.album] = (sources[i.album] || 0) + 1;
+    totalSize += i.size || 0;
+  });
+
+  $('#totalCount').textContent = allItems.length;
+  $('#photoCount').textContent = types.photo || 0;
+  $('#videoCount').textContent = types.video || 0;
+  $('#animCount').textContent = types.animation || 0;
+  $('#statStatus').textContent = d.scanning ? '⟳ Scanning' : '✓ Ready';
+  $('#statSize').textContent = fmtSize(totalSize);
+
+  const sorted = Object.entries(sources).sort((a,b) => b[1] - a[1]);
+  $('#sourceList').innerHTML = sorted.map(([n,c]) => `
+    <div class="nav-item" data-source="${n}"><span>📁</span> ${n} <span class="count">${c}</span></div>
+  `).join('');
+
+  $$('[data-source]').forEach(el => el.addEventListener('click', () => {
+    $$('.nav-item').forEach(n => n.classList.remove('active'));
+    el.classList.add('active');
+    currentFilter = 'all'; currentSource = el.dataset.source;
+    applyFilters();
+  }));
+
+  applyFilters();
+  if (d.scanning) setTimeout(fetchData, 5000);
+}
+
+function applyFilters() {
+  filtered = allItems.filter(i => {
+    if (currentFilter !== 'all' && i.type !== currentFilter) return false;
+    if (currentSource && i.album !== currentSource) return false;
+    if (currentSearch) {
+      const q = currentSearch.toLowerCase();
+      if (!`${i.title} ${i.album} ${i.caption}`.toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+  $('#topInfo').textContent = `${filtered.length} items`;
+  resetGrid();
+}
+
+// ─── Grid with pagination ───
+function resetGrid() {
+  $('#grid').innerHTML = '';
+  renderedCount = 0;
+  renderPage();
+}
+
+function renderPage() {
+  if (renderedCount >= filtered.length) {
+    $('#spinner').style.display = 'none';
+    $('#empty').style.display = filtered.length === 0 ? 'block' : 'none';
+    return;
+  }
+
+  loading = true;
+  $('#spinner').style.display = 'flex';
+  const grid = $('#grid');
+  const end = Math.min(renderedCount + PAGE_SIZE, filtered.length);
+
+  for (let idx = renderedCount; idx < end; idx++) {
+    const it = filtered[idx];
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.dataset.idx = idx;
+
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    const thumbUrl = `/thumb/${it.msg_id}`;
+    img.src = thumbUrl;
+    img.dataset.msgId = it.msg_id;
+
+    // Cache the thumb blob once loaded for instant lightbox
+    img.addEventListener('load', () => {
+      if (!thumbCache[it.msg_id]) {
+        // Create a canvas snapshot for instant display in viewer
+        try {
+          const c = document.createElement('canvas');
+          c.width = img.naturalWidth;
+          c.height = img.naturalHeight;
+          c.getContext('2d').drawImage(img, 0, 0);
+          thumbCache[it.msg_id] = c.toDataURL('image/jpeg', 0.85);
+        } catch(e) {}
+      }
+    }, { once: true });
+
+    card.appendChild(img);
+
+    const isVideo = it.type === 'video' || it.type === 'animation';
+    if (isVideo) {
+      card.insertAdjacentHTML('beforeend',
+        `<div class="play-badge"><svg viewBox="0 0 24 24"><polygon points="8,5 20,12 8,19"/></svg></div>`);
+    }
+
+    card.insertAdjacentHTML('beforeend', `
+      <div class="card-overlay">
+        <div class="card-title">${esc(it.title || it.caption || '')}</div>
+        ${it.album ? `<div class="card-sub">${esc(it.album)}</div>` : ''}
+      </div>
+      ${it.type === 'video' ? '<div class="card-badge">VIDEO</div>' : ''}
+      ${it.type === 'animation' ? '<div class="card-badge">GIF</div>' : ''}
+    `);
+
+    card.addEventListener('click', () => openViewer(+card.dataset.idx));
+    grid.appendChild(card);
+  }
+
+  renderedCount = end;
+  loading = false;
+  $('#spinner').style.display = renderedCount < filtered.length ? 'none' : 'none';
+  $('#empty').style.display = 'none';
+}
+
+// ─── Infinite scroll ───
+const observer = new IntersectionObserver(entries => {
+  if (entries[0].isIntersecting && !loading && renderedCount < filtered.length) {
+    renderPage();
+  }
+}, { rootMargin: '600px' });
+
+observer.observe($('#loadTrigger'));
+
+// ─── Viewer ───
+function openViewer(idx) {
+  viewerIdx = idx;
+  renderViewer();
+  $('#viewer').classList.add('active');
+  document.body.style.overflow = 'hidden';
+  preloadAdjacent();
+}
+
+function closeViewer() {
+  $('#viewer').classList.remove('active');
+  document.body.style.overflow = '';
+  $$('#viewerStage video').forEach(v => { v.pause(); v.src = ''; });
+  $('#viewerStage').innerHTML = '';
+  viewerIdx = -1;
+}
+
+function renderViewer() {
+  if (viewerIdx < 0 || viewerIdx >= filtered.length) return;
+  const it = filtered[viewerIdx];
+  const stage = $('#viewerStage');
+
+  // Stop any playing video
+  $$('#viewerStage video').forEach(v => { v.pause(); v.src = ''; });
+  stage.innerHTML = '';
+
+  if (it.type === 'video' || it.type === 'animation') {
+    // For video: show thumb as poster, stream the video
+    const v = document.createElement('video');
+    v.className = 'viewer-video';
+    v.controls = true;
+    v.autoplay = true;
+    v.playsInline = true;
+    v.loop = it.type === 'animation';
+    if (thumbCache[it.msg_id]) v.poster = thumbCache[it.msg_id];
+    v.src = `/stream/${it.msg_id}`;
+    stage.appendChild(v);
+  } else {
+    // Show cached thumbnail instantly (blurred), then load full-res on top
+    const cachedThumb = thumbCache[it.msg_id];
+
+    if (cachedThumb) {
+      const thumbEl = document.createElement('img');
+      thumbEl.className = 'viewer-thumb';
+      thumbEl.src = cachedThumb;
+      stage.appendChild(thumbEl);
+    }
+
+    const full = document.createElement('img');
+    full.className = 'viewer-full';
+    full.addEventListener('load', () => {
+      full.classList.add('loaded');
+    }, { once: true });
+    full.src = `/stream/${it.msg_id}`;
+    stage.appendChild(full);
+  }
+
+  // Meta
+  const meta = $('#viewerMeta');
+  let html = esc(it.title || it.caption || '');
+  if (it.album) html += ` · ${esc(it.album)}`;
+  if (it.size) html += ` · ${fmtSize(it.size)}`;
+  meta.innerHTML = html;
+
+  $('#prevBtn').style.visibility = viewerIdx > 0 ? 'visible' : 'hidden';
+  $('#nextBtn').style.visibility = viewerIdx < filtered.length - 1 ? 'visible' : 'hidden';
+}
+
+function navigateViewer(dir) {
+  const next = viewerIdx + dir;
+  if (next < 0 || next >= filtered.length) return;
+  viewerIdx = next;
+  renderViewer();
+  preloadAdjacent();
+}
+
+function preloadAdjacent() {
+  // Preload next/prev full-res images so navigation is instant
+  const preload = $('#preload');
+  preload.innerHTML = '';
+  for (const offset of [1, -1, 2]) {
+    const idx = viewerIdx + offset;
+    if (idx >= 0 && idx < filtered.length) {
+      const it = filtered[idx];
+      if (it.type !== 'video' && it.type !== 'animation') {
+        const img = document.createElement('img');
+        img.src = `/stream/${it.msg_id}`;
+        preload.appendChild(img);
+      }
+    }
+  }
+}
+
+// Swipe support for mobile viewer
+let touchStartX = 0;
+$('#viewerStage')?.addEventListener('touchstart', e => {
+  touchStartX = e.touches[0].clientX;
+}, { passive: true });
+
+$('#viewerStage')?.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  if (Math.abs(dx) > 60) {
+    navigateViewer(dx > 0 ? -1 : 1);
+  }
+});
+
+// ─── Utils ───
+function fmtSize(b) {
+  if (!b) return '—';
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(1) + ' GB';
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ─── Events ───
+$('#search').addEventListener('input', e => {
+  currentSearch = e.target.value;
+  clearTimeout(window._st);
+  window._st = setTimeout(applyFilters, 250);
+});
+
+$$('[data-filter]').forEach(el => el.addEventListener('click', () => {
+  $$('.nav-item').forEach(n => n.classList.remove('active'));
+  el.classList.add('active');
+  currentFilter = el.dataset.filter;
+  currentSource = '';
+  applyFilters();
+}));
+
+$('#viewerClose').addEventListener('click', closeViewer);
+$('#viewer').addEventListener('click', e => {
+  if (e.target === $('#viewer') || e.target === $('#viewerStage')) closeViewer();
+});
+$('#prevBtn').addEventListener('click', () => navigateViewer(-1));
+$('#nextBtn').addEventListener('click', () => navigateViewer(1));
+
+document.addEventListener('keydown', e => {
+  if (viewerIdx < 0) return;
+  if (e.key === 'Escape') closeViewer();
+  if (e.key === 'ArrowLeft') navigateViewer(-1);
+  if (e.key === 'ArrowRight') navigateViewer(1);
+});
+
+$('#menuBtn').addEventListener('click', () => $('#sidebar').classList.toggle('visible'));
+
+document.addEventListener('click', e => {
+  if (window.innerWidth <= 768 && !$('#sidebar').contains(e.target) && e.target !== $('#menuBtn'))
+    $('#sidebar').classList.remove('visible');
+});
+
+// ─── Init ───
+fetchData();
+</script>
+</body>
+</html>

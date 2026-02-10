@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-media-store"
+version = "0.1.0"
+description = "Use Telegram channels as free, unlimited cloud storage"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "telegram-media-store contributors"}]
+keywords = ["telegram", "media", "storage", "backup", "cloud"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Backup",
+]
+dependencies = [
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+server = ["fastapi>=0.100", "uvicorn[standard]>=0.20", "Pillow>=9.0", "python-multipart>=0.0.6", "httpx>=0.24"]
+fuse = ["fusepy>=3.0"]
+webdav = ["wsgidav>=4.0", "cheroot>=9.0"]
+all = ["telegram-media-store[server,fuse,webdav]", "pyrofork", "tgcrypto"]
+dev = ["pytest>=7.0", "pytest-mock"]
+
+[project.scripts]
+tg-media-store = "tg_media_store.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Kylianmgt/televault"
+
+[tool.setuptools.packages.find]
+include = ["tg_media_store*"]
+
+[tool.setuptools.package-data]
+"*" = ["static/*"]
