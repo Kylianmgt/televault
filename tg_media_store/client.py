@@ -156,19 +156,28 @@ class TelegramMediaStore:
         return HAS_PYROGRAM and bool(self.api_id) and bool(self.api_hash)
 
     def _get_pyro_client(self) -> Any:
-        """Lazily create a pyrogram client (not started)."""
+        """Lazily create a pyrogram client (not started).
+
+        Uses in-memory session storage on purpose. The previous on-disk session
+        was a single SQLite file shared by every client this class creates, so
+        two uploads in the same process — which is the normal case for a server
+        ingesting a batch — raced on it and the loser died with
+        ``sqlite3.OperationalError: database is locked``, failing every file
+        above the Bot API's 50 MB limit.
+
+        Nothing is lost by not persisting it: a bot authenticates from its token
+        on connect, so there is no login state worth keeping between runs.
+        """
         if not self.has_pyrogram:
             return None
         if self._pyro_client is None:
-            session_dir = str(self.cache_dir / "pyro_sessions")
-            os.makedirs(session_dir, exist_ok=True)
             self._pyro_client = PyroClient(
                 "tg_media_store",
                 api_id=self.api_id,
                 api_hash=self.api_hash,
                 bot_token=self.bot_token,
-                workdir=session_dir,
                 no_updates=True,
+                in_memory=True,
             )
         return self._pyro_client
 
