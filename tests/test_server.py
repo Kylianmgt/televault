@@ -73,6 +73,11 @@ def client(test_db: Path) -> TestClient:
     # Patch module-level DB_PATH
     original_db = srv.DB_PATH
     srv.DB_PATH = test_db
+    # Thumbnails cache to a real directory that outlives the test run, so a
+    # previously generated file would short-circuit the endpoint under test.
+    original_thumbs = srv.THUMBS_DIR
+    srv.THUMBS_DIR = test_db.parent / "thumbs"
+    srv.THUMBS_DIR.mkdir(parents=True, exist_ok=True)
     # Allow access without auth
     original_pass = srv.VIEWER_PASS
     srv.VIEWER_PASS = "changeme"
@@ -83,6 +88,7 @@ def client(test_db: Path) -> TestClient:
     yield tc
 
     srv.DB_PATH = original_db
+    srv.THUMBS_DIR = original_thumbs
     srv.VIEWER_PASS = original_pass
     srv.VIEWER_TOKEN = original_token
 

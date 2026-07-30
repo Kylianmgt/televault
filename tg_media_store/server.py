@@ -830,6 +830,118 @@ def _ingest_urls(body: Any) -> dict:
     return {"added": added, "skipped": skipped, "failed": failed, "results": results}
 
 
+@app.post("/api/backfill-thumbs")
+async def api_backfill_thumbs(request: Request, _auth: bool = Depends(_require_auth)):
+    """Fill in Telegram's preview id for assets stored before it was recorded.
+
+    Those assets fall back to deriving a thumbnail from the original, which the
+    Bot API cannot download above 20 MB — so large videos have no preview at all
+    until this runs. MTProto can read the stored message back and the preview id
+    is right there on it, so this costs one metadata call per 100 assets and
+    downloads nothing.
+
+    Body (optional): {"limit": 500}
+    """
+    if not (BOT_TOKEN and CHANNEL_ID):
+        raise HTTPException(503, detail="BOT_TOKEN/CHANNEL_ID not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    limit = int((body or {}).get("limit") or 500)
+
+    return await run_in_threadpool(_backfill_thumbs, limit)
+
+
+def _backfill_thumbs(limit: int) -> dict:
+    """Blocking implementation of :func:`api_backfill_thumbs`."""
+    import asyncio
+
+    from .client import TelegramMediaStore
+
+    conn = _db()
+    rows = conn.execute(
+        "SELECT telegram_message_id FROM assets "
+        "WHERE COALESCE(telegram_thumb_file_id, '') = '' "
+        "AND telegram_message_id IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    msg_ids = [r["telegram_message_id"] for r in rows]
+    if not msg_ids:
+        return {"candidates": 0, "updated": 0, "no_thumbnail": 0}
+
+    store = TelegramMediaStore(
+        bot_token=BOT_TOKEN, channel_id=CHANNEL_ID, db_path=str(DB_PATH),
+        api_id=TG_API_ID if TG_API_ID else None,
+        api_hash=TG_API_HASH if TG_API_HASH else None,
+    )
+    if not store.has_pyrogram:
+        store.close()
+        raise HTTPException(
+            503, detail="MTProto not configured — set TG_API_ID/TG_API_HASH to backfill"
+        )
+
+    client = store._get_pyro_client()
+
+    def thumb_of(message: Any) -> str:
+        for attr in ("video", "document", "animation", "audio"):
+            media = getattr(message, attr, None)
+            if not media:
+                continue
+            thumbs = getattr(media, "thumbs", None) or []
+            if thumbs:
+                return thumbs[-1].file_id
+        return ""
+
+    async def collect() -> dict:
+        found: dict = {}
+        async with client:
+            for start in range(0, len(msg_ids), 100):
+                batch = msg_ids[start:start + 100]
+                messages = await client.get_messages(int(CHANNEL_ID), batch)
+                if not isinstance(messages, list):
+                    messages = [messages]
+                for message in messages:
+                    if message is None:
+                        continue
+                    tid = thumb_of(message)
+                    if tid:
+                        found[message.id] = tid
+        return found
+
+    loop = asyncio.new_event_loop()
+    try:
+        found = loop.run_until_complete(collect())
+    except Exception:
+        logger.exception("thumbnail backfill failed")
+        raise HTTPException(502, detail="backfill failed — see server logs")
+    finally:
+        loop.close()
+        store._pyro_client = None
+
+    updated = 0
+    if found:
+        conn = _db()
+        conn.executemany(
+            "UPDATE assets SET telegram_thumb_file_id = ? WHERE telegram_message_id = ?",
+            [(tid, mid) for mid, tid in found.items()],
+        )
+        conn.commit()
+        conn.close()
+        updated = len(found)
+
+    store.close()
+    return {
+        "candidates": len(msg_ids),
+        "updated": updated,
+        "no_thumbnail": len(msg_ids) - updated,
+    }
+
+
 @app.post("/api/upload")
 async def api_upload(file: UploadFile, _auth: bool = Depends(_require_auth)):
     """Upload a file via the web UI."""
