@@ -768,3 +768,37 @@ class TestDiskGuards:
             assert not (srv.THUMBS_DIR / "t0.jpg").exists()
         finally:
             srv.THUMBS_DIR, srv.THUMBS_MAX_BYTES = orig
+
+    def test_caller_max_bytes_overrides_the_server_default(self, client: TestClient) -> None:
+        """A caller's cap must be enforced here: its own pre-check relies on
+        Content-Length, which a server may not send."""
+        import tg_media_store.server as srv
+        orig = (srv.BOT_TOKEN, srv.CHANNEL_ID)
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+
+        class NoLength:
+            headers: dict = {}
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def raise_for_status(self): return None
+            def iter_content(self, chunk_size=0):
+                for _ in range(8):
+                    yield b"q" * (1024 * 1024)
+
+        try:
+            with patch("tg_media_store.client.TelegramMediaStore"):
+                with patch.object(srv.requests, "get", return_value=NoLength()):
+                    r = client.post("/api/ingest-url", json={
+                        "url": "https://e.test/nolength.mp4",
+                        "max_bytes": 2 * 1024 * 1024,
+                    })
+            body = r.json()
+            assert body["failed"] == 1
+            assert "2 MB download limit" in body["results"][0]["error"]
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+    def test_caller_cannot_raise_the_limit_above_the_server_ceiling(self) -> None:
+        import tg_media_store.server as srv
+        # min() of the two, so a caller can tighten but never loosen.
+        assert min(srv.MAX_DOWNLOAD_BYTES, 999 * 1024**3) == srv.MAX_DOWNLOAD_BYTES

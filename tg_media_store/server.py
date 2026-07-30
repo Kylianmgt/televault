@@ -256,6 +256,7 @@ async def startup() -> None:
     if reclaimed:
         logger.info("reclaimed %d stale ingest directories", reclaimed)
     trim_thumbnail_cache()
+    _start_janitor()
 
     # Start pyrogram if configured
     pyro = _get_pyro_client()
@@ -718,6 +719,36 @@ MAX_DOWNLOAD_BYTES = int(os.environ.get("TG_STORE_MAX_DOWNLOAD_MB", "2048")) * 1
 THUMBS_MAX_BYTES = int(os.environ.get("TG_STORE_THUMBS_MAX_MB", "512")) * 1024 * 1024
 
 
+JANITOR_INTERVAL_SECONDS = int(os.environ.get("TG_STORE_JANITOR_SECONDS", "300"))
+_janitor_started = False
+
+
+def _start_janitor() -> None:
+    """Sweep scratch space on a timer.
+
+    Sweeping only between batches is not enough: one batch can run for a long
+    time, and anything a failed item leaves behind sits on disk for the whole
+    duration. A daemon thread keeps that bounded regardless of batch length.
+    """
+    global _janitor_started
+    if _janitor_started:
+        return
+    _janitor_started = True
+
+    def loop() -> None:
+        while True:
+            time.sleep(JANITOR_INTERVAL_SECONDS)
+            try:
+                removed = sweep_ingest_temp()
+                if removed:
+                    logger.info("janitor reclaimed %d stale ingest directories", removed)
+                trim_thumbnail_cache()
+            except Exception:
+                logger.warning("janitor pass failed", exc_info=True)
+
+    threading.Thread(target=loop, name="televault-janitor", daemon=True).start()
+
+
 def _free_bytes() -> int:
     """Bytes available on the filesystem holding the scratch directory."""
     try:
@@ -797,6 +828,13 @@ def _ingest_one(item: Any, store_factory: Any) -> dict:
     if not name:
         name = "download"
 
+    # A caller may request a tighter ceiling than the server default.
+    try:
+        requested = int(item.get("max_bytes") or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    limit_bytes = min(MAX_DOWNLOAD_BYTES, requested) if requested > 0 else MAX_DOWNLOAD_BYTES
+
     store = store_factory()
     try:
         # Download into a temp *directory* under the intended filename: the
@@ -828,11 +866,14 @@ def _ingest_one(item: Any, store_factory: Any) -> dict:
                                 continue
                             written += len(chunk)
                             # Enforced while streaming, not from Content-Length,
-                            # which a server may omit or understate.
-                            if written > MAX_DOWNLOAD_BYTES:
+                            # which a server may omit or understate. A caller
+                            # that asked for a smaller ceiling gets that one:
+                            # its own pre-check cannot fire without a
+                            # Content-Length, so this is the real limit.
+                            if written > limit_bytes:
                                 raise ValueError(
-                                    f"exceeds the {MAX_DOWNLOAD_BYTES // 1048576} MB "
-                                    "per-file download limit"
+                                    f"exceeds the {limit_bytes // 1048576} MB "
+                                    "download limit"
                                 )
                             fh.write(chunk)
 
