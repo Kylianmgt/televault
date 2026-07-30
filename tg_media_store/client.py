@@ -17,7 +17,10 @@ import json
 import logging
 import mimetypes
 import os
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -114,6 +117,34 @@ def _extract_thumb_file_id(result: Dict[str, Any]) -> str:
         if file_id:
             return file_id
     return ""
+
+
+def make_video_poster(filepath: Union[str, Path], dest: Union[str, Path]) -> bool:
+    """Extract a small JPEG poster from a video with ffmpeg.
+
+    Telegram only keeps a preview for a *document* if the uploader supplies one,
+    and archival uploads are documents so the bytes survive intact. Sending this
+    alongside means the stored message carries a preview, which is what makes a
+    thumbnail cheap to serve later instead of requiring the whole file back.
+
+    Returns True if a poster was written.
+    """
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-loglevel", "error", "-y",
+                "-i", str(filepath), "-frames:v", "1",
+                # Telegram wants the preview under 200 KB and 320 px on a side.
+                "-vf", "thumbnail,scale=320:-2",
+                "-f", "image2", str(dest),
+            ],
+            check=True, timeout=120,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+    dest = Path(dest)
+    return dest.exists() and 0 < dest.stat().st_size
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +353,14 @@ class TelegramMediaStore:
         is_video = mime.startswith("video/") and not as_document
         is_image = mime.startswith("image/") and not as_document
 
+        poster_dir = None
+        poster_path = None
+        poster_handle = None
+        if mime.startswith("video/") and (as_document or not is_video):
+            poster_dir = tempfile.mkdtemp()
+            candidate = Path(poster_dir) / "poster.jpg"
+            poster_path = candidate if make_video_poster(filepath, candidate) else None
+
         try:
             with open(filepath, "rb") as f:
                 if is_video:
@@ -340,6 +379,16 @@ class TelegramMediaStore:
                     endpoint = f"{self._base_url}/sendDocument"
                     files = {"document": (filepath.name, f, mime)}
                     data = {"chat_id": self.channel_id, "caption": caption[:1024]}
+                    # Telegram keeps no preview for a document unless one is
+                    # attached. Without it every archival video is previewless.
+                    if mime.startswith("video/") and poster_path is not None:
+                        try:
+                            poster_handle = open(poster_path, "rb")
+                            files["thumbnail"] = ("poster.jpg", poster_handle, "image/jpeg")
+                        except OSError:
+                            # A preview is a nice-to-have; never lose the upload
+                            # itself because the poster could not be read.
+                            logger.warning("poster unreadable for %s", filepath.name)
 
                 r = requests.post(endpoint, files=files, data=data, timeout=300)
 
@@ -398,6 +447,14 @@ class TelegramMediaStore:
             # Callers only see None, so without this the cause is unrecoverable.
             logger.exception("Bot API upload failed: %s", filepath.name)
             return None
+        finally:
+            if poster_handle is not None:
+                try:
+                    poster_handle.close()
+                except Exception:
+                    pass
+            if poster_dir:
+                shutil.rmtree(poster_dir, ignore_errors=True)
 
     def upload_large_file(
         self,
@@ -443,6 +500,13 @@ class TelegramMediaStore:
         # Documents are stored byte-for-byte; send_video may transcode.
         is_video = mime.startswith("video/") and not as_document
 
+        poster_dir = None
+        poster_path = None
+        if mime.startswith("video/"):
+            poster_dir = tempfile.mkdtemp()
+            candidate = Path(poster_dir) / "poster.jpg"
+            poster_path = candidate if make_video_poster(filepath, candidate) else None
+
         client = self._get_pyro_client()
 
         def _thumb_of(media: Any) -> str:
@@ -467,6 +531,9 @@ class TelegramMediaStore:
                         channel_id, str(filepath),
                         caption=caption[:1024],
                         file_name=filepath.name,
+                        # Same reason as the Bot API path: a document carries no
+                        # preview unless one is supplied.
+                        **({"thumb": str(poster_path)} if poster_path else {}),
                     )
                     fid = msg.document.file_id if msg.document else ""
                     tid = _thumb_of(msg.document) if msg.document else ""
@@ -509,6 +576,9 @@ class TelegramMediaStore:
             # 50 MB limit; a silent None here looks identical to "too big".
             logger.exception("MTProto upload failed: %s", filepath.name)
             return None
+        finally:
+            if poster_dir:
+                shutil.rmtree(poster_dir, ignore_errors=True)
 
     def upload_directory(
         self,

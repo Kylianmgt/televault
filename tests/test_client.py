@@ -297,3 +297,86 @@ class TestFileIdExtraction:
         assert result is not None
         assert result["file_id"] == "vid_id"
         assert result["message_id"] == 55
+
+
+class TestVideoPoster:
+    """Documents carry no Telegram preview unless one is attached, and archival
+    uploads are documents — so videos must ship a poster with them."""
+
+    @patch("tg_media_store.client.requests.post")
+    def test_video_document_upload_attaches_a_thumbnail(
+        self, mock_post: MagicMock, store: TelegramMediaStore, tmp_path: Path
+    ) -> None:
+        clip = tmp_path / "clip.mp4"
+        clip.write_bytes(b"\x00fake-mp4")
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"ok": True, "result": {"message_id": 3,
+                                                 "document": {"file_id": "d",
+                                                              "thumbnail": {"file_id": "t"}}}},
+        )
+        def fake_poster(src, dest):
+            Path(dest).write_bytes(b"\xff\xd8\xff-poster")
+            return True
+
+        with patch("tg_media_store.client.make_video_poster", side_effect=fake_poster):
+            store.upload_file(clip, as_document=True)
+
+        files = mock_post.call_args.kwargs["files"]
+        assert "thumbnail" in files, "no poster sent — Telegram will store no preview"
+
+    @patch("tg_media_store.client.requests.post")
+    def test_stores_the_returned_thumb_file_id(
+        self, mock_post: MagicMock, store: TelegramMediaStore, tmp_path: Path
+    ) -> None:
+        clip = tmp_path / "clip2.mp4"
+        clip.write_bytes(b"\x00fake-mp4-2")
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"ok": True, "result": {"message_id": 4,
+                                                 "document": {"file_id": "d2",
+                                                              "thumbnail": {"file_id": "thumb42"}}}},
+        )
+        def fake_poster(src, dest):
+            Path(dest).write_bytes(b"\xff\xd8\xff-poster")
+            return True
+
+        with patch("tg_media_store.client.make_video_poster", side_effect=fake_poster):
+            result = store.upload_file(clip, as_document=True)
+
+        conn = store._get_conn()
+        row = conn.execute(
+            "SELECT telegram_thumb_file_id FROM assets WHERE id = ?", (result["id"],)
+        ).fetchone()
+        assert row[0] == "thumb42"
+
+    @patch("tg_media_store.client.requests.post")
+    def test_non_video_document_sends_no_poster(
+        self, mock_post: MagicMock, store: TelegramMediaStore, tmp_path: Path
+    ) -> None:
+        doc = tmp_path / "notes.pdf"
+        doc.write_bytes(b"%PDF-1.4 fake")
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"ok": True, "result": {"message_id": 5, "document": {"file_id": "d3"}}},
+        )
+        store.upload_file(doc, as_document=True)
+        assert "thumbnail" not in mock_post.call_args.kwargs["files"]
+
+    @patch("tg_media_store.client.requests.post")
+    def test_unreadable_poster_does_not_lose_the_upload(
+        self, mock_post: MagicMock, store: TelegramMediaStore, tmp_path: Path
+    ) -> None:
+        """A preview is cosmetic — the file must still be stored without it."""
+        clip = tmp_path / "clip3.mp4"
+        clip.write_bytes(b"\x00fake-mp4-3")
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"ok": True, "result": {"message_id": 6, "document": {"file_id": "d4"}}},
+        )
+        # claims success but writes nothing
+        with patch("tg_media_store.client.make_video_poster", return_value=True):
+            result = store.upload_file(clip, as_document=True)
+
+        assert result is not None
+        assert result["file_id"] == "d4"
