@@ -24,6 +24,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
@@ -50,12 +51,16 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+import logging
+
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+
+logger = logging.getLogger(__name__)
 
 try:
     from PIL import Image, ImageFile
@@ -192,7 +197,8 @@ def _init_db() -> None:
             telegram_message_id INTEGER,
             channel_id TEXT,
             uploaded_at TEXT,
-            metadata TEXT
+            metadata TEXT,
+            telegram_thumb_file_id TEXT
         )
     """)
     conn.execute("""
@@ -212,6 +218,9 @@ def _init_db() -> None:
             UNIQUE(album_id, asset_id)
         )
     """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(assets)")}
+    if "telegram_thumb_file_id" not in cols:
+        conn.execute("ALTER TABLE assets ADD COLUMN telegram_thumb_file_id TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(file_hash)")
     conn.commit()
     conn.close()
@@ -404,7 +413,8 @@ def thumb(msg_id: int, _auth: bool = Depends(_require_auth)):
     """Return a thumbnail for the given message_id."""
     conn = _db()
     row = conn.execute(
-        "SELECT telegram_file_id, mime_type, file_size FROM assets WHERE telegram_message_id = ?",
+        "SELECT telegram_file_id, mime_type, file_size, telegram_thumb_file_id "
+        "FROM assets WHERE telegram_message_id = ?",
         (msg_id,),
     ).fetchone()
     conn.close()
@@ -420,6 +430,25 @@ def thumb(msg_id: int, _auth: bool = Depends(_require_auth)):
     # Download original and create thumbnail
     if not BOT_TOKEN:
         raise HTTPException(503, detail="BOT_TOKEN not configured")
+
+    # Telegram already generated a preview at upload time. It is a few KB and
+    # fetchable whatever the original weighs, so prefer it: pulling the original
+    # back costs megabytes per tile, and the Bot API cannot download over 20 MB
+    # at all — which is why large videos previously had no thumbnail.
+    tg_thumb_id = row["telegram_thumb_file_id"] if "telegram_thumb_file_id" in row.keys() else None
+    if tg_thumb_id:
+        try:
+            tr = requests.get(f"{_tg_base()}/getFile", params={"file_id": tg_thumb_id}, timeout=30)
+            if tr.status_code == 200:
+                tpath = tr.json()["result"]["file_path"]
+                data = requests.get(
+                    f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tpath}", timeout=60
+                ).content
+                if data:
+                    thumb_path.write_bytes(data)
+                    return Response(data, media_type="image/jpeg")
+        except Exception:
+            logger.warning("Telegram thumbnail fetch failed for %s", msg_id, exc_info=True)
 
     file_id = row["telegram_file_id"]
     try:
@@ -668,115 +697,135 @@ async def api_ingest_url(request: Request, _auth: bool = Depends(_require_auth))
     return await run_in_threadpool(_ingest_urls, body)
 
 
+INGEST_CONCURRENCY = max(1, int(os.environ.get("TG_STORE_INGEST_CONCURRENCY", "3")))
+
+
+def _ingest_one(item: Any, store_factory: Any) -> dict:
+    """Fetch one URL and store it. Returns a per-item result dict.
+
+    Each call gets its own store (and therefore its own SQLite connection),
+    because sqlite3 connections are not safe to share across threads.
+    """
+    from .client import LARGE_FILE_THRESHOLD
+
+    url = (item or {}).get("url")
+    if not url:
+        return {"url": None, "ok": False, "error": "missing url"}
+
+    # Derive a filename with a usable suffix — the upload path picks the
+    # Telegram method (photo/video/animation/document) from the MIME type,
+    # which mimetypes infers from the extension.
+    name = (item.get("filename") or "").strip() or Path(str(url).split("?")[0]).name
+    if not name:
+        name = "download"
+
+    store = store_factory()
+    try:
+        # Download into a temp *directory* under the intended filename: the
+        # upload path records `filepath.name` as the asset filename, so a
+        # NamedTemporaryFile would immortalise its own "tmpab12cd_" prefix.
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir) / Path(name).name
+                with requests.get(url, stream=True, timeout=120) as resp:
+                    resp.raise_for_status()
+                    with open(tmp_path, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=1 << 20):
+                            if chunk:
+                                fh.write(chunk)
+
+                # A file too big for the Bot API with no MTProto configured can
+                # never upload. Say so, instead of a bare "upload failed" that
+                # gives the caller nothing to act on.
+                size = tmp_path.stat().st_size
+                if size > LARGE_FILE_THRESHOLD and not store.has_pyrogram:
+                    return {
+                        "url": url,
+                        "ok": False,
+                        "error": (
+                            f"file is {size / 1048576:.1f} MB; the Bot API caps uploads at "
+                            f"{LARGE_FILE_THRESHOLD // 1048576} MB. Set TG_API_ID/TG_API_HASH "
+                            "and install pyrofork to store files this large."
+                        ),
+                    }
+
+                result = store.upload_file(
+                    str(tmp_path),
+                    metadata=item.get("metadata"),
+                    caption=(item.get("caption") or "")[:1024],
+                    # Importers are archiving, so default to preserving the
+                    # original bytes; pass "as_document": false to opt into
+                    # Telegram's inline previews instead.
+                    as_document=bool(item.get("as_document", True)),
+                )
+        except Exception as exc:  # network error, bad status, upload error
+            return {"url": url, "ok": False, "error": str(exc)}
+
+        if not result:
+            return {"url": url, "ok": False, "error": "upload failed"}
+
+        # A dedup hit returns only {"id": …} with no message_id.
+        is_new = "message_id" in result
+
+        album = (item.get("album") or "").strip()
+        if album:
+            try:
+                album_id = store.get_or_create_album(album)
+                store.add_to_album(album_id, result["id"])
+            except Exception:
+                # Album bookkeeping is best-effort; the asset is already safe.
+                logger.warning("album bookkeeping failed for %s", url, exc_info=True)
+
+        return {
+            "url": url,
+            "ok": True,
+            "deduped": not is_new,
+            "asset_id": result["id"],
+            "msg_id": result.get("message_id"),
+        }
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
+
+
 def _ingest_urls(body: Any) -> dict:
-    """Blocking implementation of :func:`api_ingest_url`. Runs off the loop."""
+    """Blocking implementation of :func:`api_ingest_url`. Runs off the loop.
+
+    Items are fetched and uploaded concurrently: each one spends most of its
+    time waiting on network I/O, so running them one at a time left the link
+    idle. Concurrency is deliberately modest — Telegram rate-limits a channel,
+    and the client already backs off on 429 — and tunable via
+    TG_STORE_INGEST_CONCURRENCY.
+    """
     items = body if isinstance(body, list) else [body]
     if not items:
         return {"added": 0, "skipped": 0, "failed": 0, "results": []}
 
-    from .client import LARGE_FILE_THRESHOLD, TelegramMediaStore
+    from .client import TelegramMediaStore
 
-    store = TelegramMediaStore(
-        bot_token=BOT_TOKEN,
-        channel_id=CHANNEL_ID,
-        db_path=str(DB_PATH),
-        upload_delay=0,
-        api_id=TG_API_ID if TG_API_ID else None,
-        api_hash=TG_API_HASH if TG_API_HASH else None,
-    )
+    def store_factory() -> Any:
+        return TelegramMediaStore(
+            bot_token=BOT_TOKEN,
+            channel_id=CHANNEL_ID,
+            db_path=str(DB_PATH),
+            upload_delay=0,
+            api_id=TG_API_ID if TG_API_ID else None,
+            api_hash=TG_API_HASH if TG_API_HASH else None,
+        )
 
-    results: list[dict] = []
-    added = skipped = failed = 0
+    workers = min(INGEST_CONCURRENCY, len(items))
+    if workers <= 1:
+        results = [_ingest_one(item, store_factory) for item in items]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # Results keep the caller's ordering so a client can match them up.
+            results = list(pool.map(lambda it: _ingest_one(it, store_factory), items))
 
-    try:
-        for item in items:
-            url = (item or {}).get("url")
-            if not url:
-                failed += 1
-                results.append({"url": None, "ok": False, "error": "missing url"})
-                continue
-
-            # Derive a filename with a usable suffix — the upload path picks the
-            # Telegram method (photo/video/animation/document) from the MIME
-            # type, which mimetypes infers from the extension.
-            name = (item.get("filename") or "").strip() or Path(str(url).split("?")[0]).name
-            if not name:
-                name = "download"
-
-            # Download into a temp *directory* under the intended filename:
-            # the upload path records `filepath.name` as the asset filename, so
-            # a NamedTemporaryFile would immortalise its own "tmpab12cd_" prefix.
-            try:
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    tmp_path = Path(tmp_dir) / Path(name).name
-                    with requests.get(url, stream=True, timeout=120) as resp:
-                        resp.raise_for_status()
-                        with open(tmp_path, "wb") as fh:
-                            for chunk in resp.iter_content(chunk_size=1 << 20):
-                                if chunk:
-                                    fh.write(chunk)
-
-                    # A file too big for the Bot API with no MTProto configured
-                    # can never upload. Say so, instead of a bare "upload
-                    # failed" that gives the caller nothing to act on.
-                    size = tmp_path.stat().st_size
-                    if size > LARGE_FILE_THRESHOLD and not store.has_pyrogram:
-                        failed += 1
-                        results.append({
-                            "url": url,
-                            "ok": False,
-                            "error": (
-                                f"file is {size / 1048576:.1f} MB; the Bot API caps uploads at "
-                                f"{LARGE_FILE_THRESHOLD // 1048576} MB. Set TG_API_ID/TG_API_HASH "
-                                "and install pyrofork to store files this large."
-                            ),
-                        })
-                        continue
-
-                    result = store.upload_file(
-                        str(tmp_path),
-                        metadata=item.get("metadata"),
-                        caption=(item.get("caption") or "")[:1024],
-                        # Importers are archiving, so default to preserving the
-                        # original bytes; pass "as_document": false to opt into
-                        # Telegram's inline previews instead.
-                        as_document=bool(item.get("as_document", True)),
-                    )
-            except Exception as exc:  # network error, bad status, upload error
-                failed += 1
-                results.append({"url": url, "ok": False, "error": str(exc)})
-                continue
-
-            if not result:
-                failed += 1
-                results.append({"url": url, "ok": False, "error": "upload failed"})
-                continue
-
-            # A dedup hit returns only {"id": …} with no message_id.
-            is_new = "message_id" in result
-            if is_new:
-                added += 1
-            else:
-                skipped += 1
-
-            album = (item.get("album") or "").strip()
-            if album:
-                try:
-                    album_id = store.get_or_create_album(album)
-                    store.add_to_album(album_id, result["id"])
-                except Exception:
-                    # Album bookkeeping is best-effort; the asset is already safe.
-                    pass
-
-            results.append({
-                "url": url,
-                "ok": True,
-                "deduped": not is_new,
-                "asset_id": result["id"],
-                "msg_id": result.get("message_id"),
-            })
-    finally:
-        store.close()
+    added = sum(1 for r in results if r.get("ok") and not r.get("deduped"))
+    skipped = sum(1 for r in results if r.get("ok") and r.get("deduped"))
+    failed = sum(1 for r in results if not r.get("ok"))
 
     return {"added": added, "skipped": skipped, "failed": failed, "results": results}
 

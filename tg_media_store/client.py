@@ -100,6 +100,22 @@ def _extract_file_id(result: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_thumb_file_id(result: Dict[str, Any]) -> str:
+    """Telegram's own generated thumbnail for a media message, if any.
+
+    Worth storing: it is a few KB and downloadable through the Bot API whatever
+    the original weighs, so serving it avoids pulling a whole video back just to
+    make a preview — which the Bot API cannot even do above 20 MB.
+    """
+    for key in ("video", "document", "animation", "audio"):
+        media = result.get(key) or {}
+        thumb = media.get("thumbnail") or media.get("thumb") or {}
+        file_id = thumb.get("file_id")
+        if file_id:
+            return file_id
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
@@ -200,7 +216,8 @@ class TelegramMediaStore:
                 telegram_message_id INTEGER,
                 channel_id TEXT,
                 uploaded_at TEXT,
-                metadata TEXT
+                metadata TEXT,
+                telegram_thumb_file_id TEXT
             )
         """)
         conn.execute("""
@@ -220,13 +237,23 @@ class TelegramMediaStore:
                 UNIQUE(album_id, asset_id)
             )
         """)
+        # Existing vaults predate this column; adding it in place keeps their
+        # index (and therefore their dedup history) intact.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(assets)")}
+        if "telegram_thumb_file_id" not in cols:
+            conn.execute("ALTER TABLE assets ADD COLUMN telegram_thumb_file_id TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(file_hash)")
         conn.commit()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path))
+            # WAL + a real busy timeout so parallel uploads queue behind each
+            # other instead of failing with "database is locked". The default
+            # 5 s timeout and rollback journal do not survive concurrent writers.
+            self._conn = sqlite3.connect(str(self.db_path), timeout=30)
             self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
         return self._conn
 
     def close(self) -> None:
@@ -338,6 +365,7 @@ class TelegramMediaStore:
             result = r.json()["result"]
             message_id = result["message_id"]
             file_id = _extract_file_id(result)
+            thumb_file_id = _extract_thumb_file_id(result)
 
             if not file_id:
                 return None
@@ -346,12 +374,13 @@ class TelegramMediaStore:
             conn.execute(
                 """INSERT INTO assets
                    (file_hash, original_path, filename, file_size, mime_type,
-                    telegram_file_id, telegram_message_id, channel_id, uploaded_at, metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    telegram_file_id, telegram_message_id, channel_id, uploaded_at,
+                    metadata, telegram_thumb_file_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     fhash, str(filepath), filepath.name, fsize, mime,
                     file_id, message_id, self.channel_id,
-                    datetime.now().isoformat(), meta_json,
+                    datetime.now().isoformat(), meta_json, thumb_file_id,
                 ),
             )
             conn.commit()
@@ -416,6 +445,11 @@ class TelegramMediaStore:
 
         client = self._get_pyro_client()
 
+        def _thumb_of(media: Any) -> str:
+            """Telegram's generated preview for a media object, if present."""
+            thumbs = getattr(media, "thumbs", None) or []
+            return thumbs[-1].file_id if thumbs else ""
+
         async def _upload() -> tuple:
             async with client:
                 channel_id = int(self.channel_id)
@@ -427,6 +461,7 @@ class TelegramMediaStore:
                         supports_streaming=True,
                     )
                     fid = msg.video.file_id if msg.video else ""
+                    tid = _thumb_of(msg.video) if msg.video else ""
                 else:
                     msg = await client.send_document(
                         channel_id, str(filepath),
@@ -434,12 +469,13 @@ class TelegramMediaStore:
                         file_name=filepath.name,
                     )
                     fid = msg.document.file_id if msg.document else ""
-                return msg.id, fid
+                    tid = _thumb_of(msg.document) if msg.document else ""
+                return msg.id, fid, tid
 
         try:
             loop = asyncio.new_event_loop()
             try:
-                message_id, file_id = loop.run_until_complete(_upload())
+                message_id, file_id, thumb_file_id = loop.run_until_complete(_upload())
             finally:
                 loop.close()
                 # Reset client so a fresh one is created next time
@@ -452,12 +488,13 @@ class TelegramMediaStore:
             conn.execute(
                 """INSERT INTO assets
                    (file_hash, original_path, filename, file_size, mime_type,
-                    telegram_file_id, telegram_message_id, channel_id, uploaded_at, metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    telegram_file_id, telegram_message_id, channel_id, uploaded_at,
+                    metadata, telegram_thumb_file_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     fhash, str(filepath), filepath.name, fsize, mime,
                     file_id, message_id, self.channel_id,
-                    datetime.now().isoformat(), meta_json,
+                    datetime.now().isoformat(), meta_json, thumb_file_id,
                 ),
             )
             conn.commit()

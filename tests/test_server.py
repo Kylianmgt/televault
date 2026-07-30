@@ -26,7 +26,8 @@ def test_db(tmp_path: Path) -> Path:
             telegram_message_id INTEGER,
             channel_id TEXT,
             uploaded_at TEXT,
-            metadata TEXT
+            metadata TEXT,
+            telegram_thumb_file_id TEXT
         )
     """)
     conn.execute("""
@@ -497,5 +498,171 @@ class TestThumbnails:
                 r = client.get("/thumb/4003")
             assert r.status_code == 404
             assert b"payload" not in r.content
+        finally:
+            srv.BOT_TOKEN = original
+
+
+class TestSchemaMigration:
+    """Existing vaults predate telegram_thumb_file_id. Adding it in place keeps
+    their dedup history — recreating the table would lose every stored hash."""
+
+    def test_missing_column_is_added_in_place(self, tmp_path: Path) -> None:
+        import tg_media_store.server as srv
+        legacy = tmp_path / "legacy.db"
+        conn = sqlite3.connect(str(legacy))
+        conn.execute("""
+            CREATE TABLE assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash TEXT UNIQUE, original_path TEXT, filename TEXT,
+                file_size INTEGER, mime_type TEXT, telegram_file_id TEXT,
+                telegram_message_id INTEGER, channel_id TEXT, uploaded_at TEXT,
+                metadata TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO assets (file_hash, filename, telegram_message_id) VALUES (?,?,?)",
+            ("keepme", "old.jpg", 1),
+        )
+        conn.commit()
+        conn.close()
+
+        original = srv.DB_PATH
+        srv.DB_PATH = legacy
+        try:
+            srv._init_db()
+            conn = sqlite3.connect(str(legacy))
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(assets)")}
+            rows = conn.execute("SELECT file_hash FROM assets").fetchall()
+            conn.close()
+            assert "telegram_thumb_file_id" in cols
+            # the pre-existing row survived
+            assert rows == [("keepme",)]
+        finally:
+            srv.DB_PATH = original
+
+
+class TestParallelIngest:
+    """Items are fetched concurrently; ordering and accounting must survive it."""
+
+    def test_results_keep_request_order(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        orig = (srv.BOT_TOKEN, srv.CHANNEL_ID)
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+        urls = [f"https://e.test/{i}.jpg" for i in range(6)]
+        try:
+            with patch.object(srv, "_ingest_one", side_effect=lambda item, f: {"url": item["url"], "ok": True, "deduped": False, "asset_id": 1, "msg_id": 2}):
+                r = client.post("/api/ingest-url", json=[{"url": u} for u in urls])
+            body = r.json()
+            assert [x["url"] for x in body["results"]] == urls
+            assert body["added"] == 6
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+    def test_runs_items_concurrently(self, client: TestClient) -> None:
+        """Sequential execution of 6 slow items would take ~6x one item."""
+        import time
+        import tg_media_store.server as srv
+        orig = (srv.BOT_TOKEN, srv.CHANNEL_ID)
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+
+        def slow(item, factory):
+            time.sleep(0.3)
+            return {"url": item["url"], "ok": True, "deduped": False, "asset_id": 1, "msg_id": 2}
+
+        try:
+            with patch.object(srv, "_ingest_one", side_effect=slow):
+                started = time.monotonic()
+                r = client.post("/api/ingest-url", json=[{"url": f"u{i}"} for i in range(6)])
+                elapsed = time.monotonic() - started
+            assert r.json()["added"] == 6
+            # 6 x 0.3s sequential = 1.8s; with 3 workers it should be well under
+            assert elapsed < 1.2, f"took {elapsed:.2f}s — looks sequential"
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+    def test_one_failing_item_does_not_sink_the_batch(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        orig = (srv.BOT_TOKEN, srv.CHANNEL_ID)
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+
+        def mixed(item, factory):
+            if item["url"].endswith("bad"):
+                return {"url": item["url"], "ok": False, "error": "boom"}
+            return {"url": item["url"], "ok": True, "deduped": False, "asset_id": 1, "msg_id": 2}
+
+        try:
+            with patch.object(srv, "_ingest_one", side_effect=mixed):
+                r = client.post("/api/ingest-url", json=[{"url": "ok1"}, {"url": "bad"}, {"url": "ok2"}])
+            body = r.json()
+            assert body["added"] == 2 and body["failed"] == 1
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+
+class TestTelegramNativeThumbnail:
+    """Prefer Telegram's own preview over pulling the original back."""
+
+    def test_uses_stored_thumb_file_id_without_downloading_original(
+        self, client: TestClient, test_db: Path
+    ) -> None:
+        import tg_media_store.server as srv
+        conn = sqlite3.connect(str(test_db))
+        conn.execute(
+            "INSERT INTO assets (file_hash, filename, file_size, mime_type, telegram_file_id, telegram_message_id, channel_id, uploaded_at, telegram_thumb_file_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("bigvid", "big.mp4", 300_000_000, "video/mp4", "orig_fid", 7001, "-100123",
+             "2026-07-30T00:00:00", "thumb_fid"),
+        )
+        conn.commit()
+        conn.close()
+
+        original = srv.BOT_TOKEN
+        srv.BOT_TOKEN = "tok"
+        requested = []
+
+        def fake_get(url, **kwargs):
+            requested.append((url, kwargs.get("params")))
+            if "getFile" in url:
+                return MagicMock(status_code=200, json=lambda: {"result": {"file_path": "thumbs/t.jpg"}})
+            return MagicMock(status_code=200, content=b"\xff\xd8\xff-tiny-jpeg")
+
+        try:
+            with patch.object(srv.requests, "get", side_effect=fake_get):
+                r = client.get("/thumb/7001")
+            assert r.status_code == 200
+            assert r.headers["content-type"] == "image/jpeg"
+            # It asked Telegram for the *thumbnail* id, never the original
+            asked = [p for _, p in requested if p]
+            assert {"file_id": "thumb_fid"} in asked
+            assert {"file_id": "orig_fid"} not in asked
+        finally:
+            srv.BOT_TOKEN = original
+
+    def test_falls_back_to_original_when_no_thumb_id(
+        self, client: TestClient, test_db: Path
+    ) -> None:
+        import tg_media_store.server as srv
+        conn = sqlite3.connect(str(test_db))
+        conn.execute(
+            "INSERT INTO assets (file_hash, filename, file_size, mime_type, telegram_file_id, telegram_message_id, channel_id, uploaded_at) VALUES (?,?,?,?,?,?,?,?)",
+            ("nothumb", "img.jpg", 2048, "image/jpeg", "orig2", 7002, "-100123", "2026-07-30T00:00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        original = srv.BOT_TOKEN
+        srv.BOT_TOKEN = "tok"
+        asked = []
+
+        def fake_get(url, **kwargs):
+            if kwargs.get("params"):
+                asked.append(kwargs["params"])
+            if "getFile" in url:
+                return MagicMock(status_code=200, json=lambda: {"result": {"file_path": "photos/i.jpg"}})
+            return MagicMock(status_code=200, content=b"rawbytes")
+
+        try:
+            with patch.object(srv.requests, "get", side_effect=fake_get):
+                client.get("/thumb/7002")
+            assert {"file_id": "orig2"} in asked
         finally:
             srv.BOT_TOKEN = original
