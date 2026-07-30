@@ -194,6 +194,54 @@ store.close()
 
 ---
 
+## 🌍 HTTP API
+
+The dashboard server exposes a small JSON API. All endpoints honour the same
+auth as the UI (basic auth, or `?token=`).
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/media` | List assets — `q`, `type`, `album`, `tag`, `limit`, `offset` |
+| `GET /api/stats` | Total asset count and stored bytes |
+| `GET /api/albums` | Albums with asset counts |
+| `GET /thumb/{msg_id}` | JPEG thumbnail |
+| `GET /stream/{msg_id}` | Stream/download the original (supports range requests) |
+| `POST /api/upload` | Multipart upload from the browser |
+| `POST /api/ingest-url` | Server-side fetch of remote URLs (below) |
+
+### Importing from remote URLs
+
+`POST /api/ingest-url` lets an external script hand TeleVault a list of URLs
+instead of the bytes. Each URL is downloaded server-side and passed through the
+normal upload path, so SHA-256 dedup, MIME routing and large-file (MTProto)
+handling all apply unchanged.
+
+```bash
+curl -u viewer:yourpass -X POST http://localhost:8099/api/ingest-url \
+  -H 'Content-Type: application/json' \
+  -d '[{"url": "https://example.com/clip.mp4",
+        "filename": "clip.mp4",
+        "album": "imported",
+        "metadata": {"source": "my-importer", "ref": "1234"}}]'
+```
+
+```json
+{"added": 1, "skipped": 0, "failed": 0,
+ "results": [{"url": "…", "ok": true, "deduped": false, "asset_id": 11, "msg_id": 99}]}
+```
+
+Each item is independent — one bad URL is reported in `results` without
+affecting the others, so a caller can retry only what failed. Re-posting a URL
+whose bytes are already stored returns `"deduped": true` and uploads nothing.
+
+Anything you put in `metadata` is stored on the asset and returned by
+`GET /api/media`. It is also searchable: `?tag=` matches against the stored
+metadata, which is the simplest way for an importer to find its own assets
+again (e.g. to skip work it has already done) without adding a column per
+use case.
+
+---
+
 ## 🐳 Docker
 
 ```bash

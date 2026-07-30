@@ -278,6 +278,7 @@ def api_media(
     q: str = "",
     type: str = "",
     album: str = "",
+    tag: str = "",
     limit: int = 100,
     offset: int = 0,
     _auth: bool = Depends(_require_auth),
@@ -287,14 +288,21 @@ def api_media(
     params: list = []
 
     if q:
-        where.append("filename LIKE ?")
-        params.append(f"%{q}%")
+        # Search the filename and any indexed metadata, so callers that store
+        # their own descriptive fields can find assets by them too.
+        where.append("(filename LIKE ? OR COALESCE(metadata, '') LIKE ?)")
+        params.extend([f"%{q}%", f"%{q}%"])
     if type:
         where.append("mime_type LIKE ?")
         params.append(f"{type}/%")
     if album:
         where.append("a.id IN (SELECT asset_id FROM album_assets aa JOIN albums al ON al.id = aa.album_id WHERE al.name = ?)")
         params.append(album)
+    if tag:
+        # Exact-ish match against a metadata value — lets an external ingester
+        # group assets without needing a dedicated column per use case.
+        where.append("COALESCE(metadata, '') LIKE ?")
+        params.append(f"%{tag}%")
 
     w = ("WHERE " + " AND ".join(where)) if where else ""
     rows = conn.execute(
@@ -330,6 +338,11 @@ def api_media(
         else:
             media_type = "other"
 
+        try:
+            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+        except (TypeError, ValueError):
+            meta = {}
+
         items.append({
             "msg_id": r["telegram_message_id"],
             "file_id": r["telegram_file_id"],
@@ -340,6 +353,7 @@ def api_media(
             "size": r["file_size"],
             "uploaded_at": r["uploaded_at"] or "",
             "caption": "",
+            "metadata": meta,
         })
 
     conn.close()
@@ -573,6 +587,118 @@ async def api_ingest(request: Request, _auth: bool = Depends(_require_auth)):
         _save_json_index()
 
     return {"added": added, "total": len(MEDIA_INDEX)}
+
+
+@app.post("/api/ingest-url")
+async def api_ingest_url(request: Request, _auth: bool = Depends(_require_auth)):
+    """Fetch remote files by URL and store them in the channel.
+
+    Accepts a single item or a list of items::
+
+        {"url": "https://…", "filename": "clip.mp4",
+         "metadata": {"source": "…"}, "album": "my-album"}
+
+    Each URL is downloaded to a temp file and handed to the normal upload path,
+    so SHA-256 dedup, MIME routing and the large-file (MTProto) route all apply
+    unchanged.  ``metadata`` is stored verbatim on the asset and is queryable
+    through ``/api/media?tag=``; ``album`` puts the asset in a named album.
+
+    Returns a per-item result so a caller can retry only what failed.
+    """
+    if not BOT_TOKEN:
+        raise HTTPException(503, detail="BOT_TOKEN not set — check your .env file")
+    if not CHANNEL_ID:
+        raise HTTPException(503, detail="CHANNEL_ID not set — check your .env file")
+
+    body = await request.json()
+    items = body if isinstance(body, list) else [body]
+    if not items:
+        return {"added": 0, "skipped": 0, "failed": 0, "results": []}
+
+    from .client import TelegramMediaStore
+
+    store = TelegramMediaStore(
+        bot_token=BOT_TOKEN,
+        channel_id=CHANNEL_ID,
+        db_path=str(DB_PATH),
+        upload_delay=0,
+        api_id=TG_API_ID if TG_API_ID else None,
+        api_hash=TG_API_HASH if TG_API_HASH else None,
+    )
+
+    results: list[dict] = []
+    added = skipped = failed = 0
+
+    try:
+        for item in items:
+            url = (item or {}).get("url")
+            if not url:
+                failed += 1
+                results.append({"url": None, "ok": False, "error": "missing url"})
+                continue
+
+            # Derive a filename with a usable suffix — the upload path picks the
+            # Telegram method (photo/video/animation/document) from the MIME
+            # type, which mimetypes infers from the extension.
+            name = (item.get("filename") or "").strip() or Path(str(url).split("?")[0]).name
+            if not name:
+                name = "download"
+
+            tmp_path = None
+            try:
+                with requests.get(url, stream=True, timeout=120) as resp:
+                    resp.raise_for_status()
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{name}") as tmp:
+                        for chunk in resp.iter_content(chunk_size=1 << 20):
+                            if chunk:
+                                tmp.write(chunk)
+                        tmp_path = tmp.name
+
+                result = store.upload_file(
+                    tmp_path,
+                    metadata=item.get("metadata"),
+                    caption=(item.get("caption") or "")[:1024],
+                )
+            except Exception as exc:  # network error, bad status, upload error
+                failed += 1
+                results.append({"url": url, "ok": False, "error": str(exc)})
+                continue
+            finally:
+                if tmp_path:
+                    Path(tmp_path).unlink(missing_ok=True)
+
+            if not result:
+                failed += 1
+                results.append({"url": url, "ok": False, "error": "upload failed"})
+                continue
+
+            # A dedup hit returns only {"id": …} with no message_id.
+            is_new = "message_id" in result
+            if is_new:
+                added += 1
+            else:
+                skipped += 1
+
+            album = (item.get("album") or "").strip()
+            if album:
+                try:
+                    album_id = store.get_or_create_album(album)
+                    store.add_to_album(album_id, result["id"])
+                except Exception:
+                    # Album bookkeeping is best-effort; the asset is already safe.
+                    pass
+
+            results.append({
+                "url": url,
+                "ok": True,
+                "deduped": not is_new,
+                "asset_id": result["id"],
+                "msg_id": result.get("message_id"),
+            })
+    finally:
+        store.close()
+
+    return {"added": added, "skipped": skipped, "failed": failed, "results": results}
 
 
 @app.post("/api/upload")
