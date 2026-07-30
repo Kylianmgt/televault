@@ -240,6 +240,14 @@ metadata, which is the simplest way for an importer to find its own assets
 again (e.g. to skip work it has already done) without adding a column per
 use case.
 
+**Lossless by default.** Telegram re-encodes anything sent as a photo — a PNG
+comes back as JPEG, and images wider than ~1280 px are downscaled. `ingest-url`
+therefore stores files as **documents** (byte-for-byte) by default, so an
+archived file streams back identical to the original. Pass `"as_document": false`
+on an item if you would rather have Telegram's inline previews and accept the
+re-encode. (The Python API mirrors this with `upload_file(..., as_document=True)`;
+its own default stays photo/video for backward compatibility.)
+
 ---
 
 ## 🐳 Docker

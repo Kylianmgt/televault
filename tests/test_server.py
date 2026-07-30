@@ -1,5 +1,6 @@
 """Tests for tg_media_store.server FastAPI endpoints."""
 
+import pathlib
 import sqlite3
 from pathlib import Path
 from unittest.mock import patch
@@ -381,6 +382,36 @@ class TestApiIngestUrl:
                         "url": "https://e.test/video.mp4?tag=1&name=x",
                     })
             path = store.upload_file.call_args[0][0]
-            assert path.endswith("video.mp4")
+            # The recorded filename must be the intended one, with no temp-file
+            # prefix leaking into it.
+            assert pathlib.Path(path).name == "video.mp4"
         finally:
             srv.BOT_TOKEN, srv.CHANNEL_ID = orig_token, orig_channel
+
+
+class TestHealthz:
+    """The liveness probe must work without credentials — an orchestrator has
+    none, and a probe that 401s marks a healthy container as failed."""
+
+    def test_healthz_open_when_auth_is_configured(self, test_db: Path) -> None:
+        import tg_media_store.server as srv
+        original_db, original_pass, original_token = srv.DB_PATH, srv.VIEWER_PASS, srv.VIEWER_TOKEN
+        srv.DB_PATH = test_db
+        srv.VIEWER_PASS = "secret123"
+        srv.VIEWER_TOKEN = ""
+        try:
+            tc = TestClient(srv.app)
+            # A credentialled endpoint rejects us…
+            assert tc.get("/api/stats").status_code == 401
+            # …but the probe still answers.
+            r = tc.get("/healthz")
+            assert r.status_code == 200
+            assert r.json() == {"ok": True}
+        finally:
+            srv.DB_PATH, srv.VIEWER_PASS, srv.VIEWER_TOKEN = original_db, original_pass, original_token
+
+    def test_healthz_reports_503_when_index_unreadable(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        with patch.object(srv, "_db", side_effect=sqlite3.OperationalError("locked")):
+            r = client.get("/healthz")
+        assert r.status_code == 503

@@ -273,6 +273,22 @@ def index(_auth: bool = Depends(_require_auth)) -> str:
     return _GALLERY_HTML
 
 
+@app.get("/healthz")
+def healthz():
+    """Liveness probe — deliberately unauthenticated.
+
+    Container orchestrators need to probe the app without credentials, and this
+    reveals nothing beyond "the process is up and the index is readable".
+    """
+    try:
+        conn = _db()
+        conn.execute("SELECT 1 FROM assets LIMIT 1").fetchone()
+        conn.close()
+    except Exception:
+        raise HTTPException(503, detail="index unavailable")
+    return {"ok": True}
+
+
 @app.get("/api/media")
 def api_media(
     q: str = "",
@@ -644,28 +660,32 @@ async def api_ingest_url(request: Request, _auth: bool = Depends(_require_auth))
             if not name:
                 name = "download"
 
-            tmp_path = None
+            # Download into a temp *directory* under the intended filename:
+            # the upload path records `filepath.name` as the asset filename, so
+            # a NamedTemporaryFile would immortalise its own "tmpab12cd_" prefix.
             try:
-                with requests.get(url, stream=True, timeout=120) as resp:
-                    resp.raise_for_status()
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{name}") as tmp:
-                        for chunk in resp.iter_content(chunk_size=1 << 20):
-                            if chunk:
-                                tmp.write(chunk)
-                        tmp_path = tmp.name
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_path = Path(tmp_dir) / Path(name).name
+                    with requests.get(url, stream=True, timeout=120) as resp:
+                        resp.raise_for_status()
+                        with open(tmp_path, "wb") as fh:
+                            for chunk in resp.iter_content(chunk_size=1 << 20):
+                                if chunk:
+                                    fh.write(chunk)
 
-                result = store.upload_file(
-                    tmp_path,
-                    metadata=item.get("metadata"),
-                    caption=(item.get("caption") or "")[:1024],
-                )
+                    result = store.upload_file(
+                        str(tmp_path),
+                        metadata=item.get("metadata"),
+                        caption=(item.get("caption") or "")[:1024],
+                        # Importers are archiving, so default to preserving the
+                        # original bytes; pass "as_document": false to opt into
+                        # Telegram's inline previews instead.
+                        as_document=bool(item.get("as_document", True)),
+                    )
             except Exception as exc:  # network error, bad status, upload error
                 failed += 1
                 results.append({"url": url, "ok": False, "error": str(exc)})
                 continue
-            finally:
-                if tmp_path:
-                    Path(tmp_path).unlink(missing_ok=True)
 
             if not result:
                 failed += 1

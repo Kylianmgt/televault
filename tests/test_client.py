@@ -196,3 +196,56 @@ class TestListAndGet:
         asset = store.get_asset(r["id"])
         assert asset is not None
         assert asset["file_hash"] is not None
+
+
+class TestLosslessUpload:
+    """as_document stores bytes verbatim — Telegram re-encodes photos, so an
+    archival importer must be able to bypass that."""
+
+    @patch("tg_media_store.client.requests.post")
+    def test_as_document_sends_to_sendDocument(
+        self, mock_post: MagicMock, store: TelegramMediaStore, sample_image: Path
+    ) -> None:
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"ok": True, "result": {"message_id": 7, "document": {"file_id": "doc_id"}}},
+        )
+        result = store.upload_file(sample_image, as_document=True)
+
+        assert result is not None
+        # The file_id must be read from the document key, not photo
+        assert result["file_id"] == "doc_id"
+        endpoint = mock_post.call_args[0][0]
+        assert endpoint.endswith("/sendDocument")
+
+    @patch("tg_media_store.client.requests.post")
+    def test_default_still_sends_photo_inline(
+        self, mock_post: MagicMock, store: TelegramMediaStore, sample_image: Path
+    ) -> None:
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"ok": True, "result": {"message_id": 8, "photo": [{"file_id": "photo_id", "width": 800, "height": 800}]}},
+        )
+        result = store.upload_file(sample_image)
+
+        assert result["file_id"] == "photo_id"
+        assert mock_post.call_args[0][0].endswith("/sendPhoto")
+
+    @patch("tg_media_store.client.requests.post")
+    def test_dimension_fallback_reads_document_file_id(
+        self, mock_post: MagicMock, store: TelegramMediaStore, sample_image: Path
+    ) -> None:
+        """A photo Telegram rejects for its dimensions is retried as a document;
+        the successful upload must not be dropped by reading the wrong key."""
+        first = MagicMock(status_code=400, text="Bad Request: PHOTO_INVALID_DIMENSIONS")
+        second = MagicMock(
+            status_code=200,
+            json=lambda: {"ok": True, "result": {"message_id": 9, "document": {"file_id": "fallback_doc"}}},
+        )
+        mock_post.side_effect = [first, second]
+
+        result = store.upload_file(sample_image)
+
+        assert result is not None
+        assert result["file_id"] == "fallback_doc"
+        assert result["message_id"] == 9

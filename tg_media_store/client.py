@@ -212,6 +212,7 @@ class TelegramMediaStore:
         filepath: Union[str, Path],
         metadata: Optional[Dict[str, Any]] = None,
         caption: str = "",
+        as_document: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Upload a single file to the Telegram channel.
 
@@ -221,6 +222,12 @@ class TelegramMediaStore:
 
         Files larger than 50 MB are automatically routed through pyrogram
         (MTProto) if configured.
+
+        Set ``as_document=True`` to store the file byte-for-byte. Telegram
+        re-encodes anything sent as a photo — a PNG comes back as JPEG, and
+        images wider than ~1280 px are downscaled — so archival callers that
+        need the original should pass this. The trade-off is that Telegram
+        clients show the file as an attachment rather than an inline preview.
         """
         filepath = Path(filepath)
         if not filepath.exists():
@@ -242,14 +249,19 @@ class TelegramMediaStore:
 
         # Route large files through pyrogram
         if fsize > LARGE_FILE_THRESHOLD and self.has_pyrogram:
-            return self.upload_large_file(filepath, metadata=metadata, caption=caption, _hash=fhash)
+            return self.upload_large_file(
+                filepath, metadata=metadata, caption=caption, _hash=fhash,
+                as_document=as_document,
+            )
 
         mime, _ = mimetypes.guess_type(str(filepath))
         if not mime:
             mime = "application/octet-stream"
 
-        is_video = mime.startswith("video/")
-        is_image = mime.startswith("image/")
+        # as_document forces the lossless path: Telegram leaves documents alone
+        # but re-encodes photos and may transcode videos.
+        is_video = mime.startswith("video/") and not as_document
+        is_image = mime.startswith("image/") and not as_document
 
         try:
             with open(filepath, "rb") as f:
@@ -261,7 +273,7 @@ class TelegramMediaStore:
                     endpoint = f"{self._base_url}/sendPhoto"
                     files = {"photo": (filepath.name, f, mime)}
                     data = {"chat_id": self.channel_id, "caption": caption[:1024]}
-                elif mime == "image/gif":
+                elif mime == "image/gif" and not as_document:
                     endpoint = f"{self._base_url}/sendAnimation"
                     files = {"animation": (filepath.name, f, mime)}
                     data = {"chat_id": self.channel_id, "caption": caption[:1024]}
@@ -276,7 +288,12 @@ class TelegramMediaStore:
             if r.status_code == 429:
                 retry_after = r.json().get("parameters", {}).get("retry_after", 30)
                 time.sleep(retry_after)
-                return self.upload_file(filepath, metadata, caption)
+                return self.upload_file(filepath, metadata, caption, as_document)
+
+            # Which kind of message Telegram actually accepted. The dimension
+            # fallback below changes it, and the file_id lives under a different
+            # key per kind — reading the wrong one loses a successful upload.
+            sent_as_document = as_document or not (is_video or is_image)
 
             if r.status_code == 400 and is_image and "PHOTO_INVALID_DIMENSIONS" in (r.text or ""):
                 # Retry as document
@@ -287,6 +304,7 @@ class TelegramMediaStore:
                         data={"chat_id": self.channel_id, "caption": caption[:1024]},
                         timeout=300,
                     )
+                sent_as_document = True
 
             if r.status_code != 200:
                 return None
@@ -294,13 +312,15 @@ class TelegramMediaStore:
             result = r.json()["result"]
             message_id = result["message_id"]
 
-            if is_video:
+            if sent_as_document:
+                file_id = result.get("document", {}).get("file_id", "")
+            elif is_video:
                 file_id = result.get("video", {}).get("file_id", "")
-            elif is_image and mime != "image/gif":
-                photos = result.get("photo", [])
-                file_id = photos[-1]["file_id"] if photos else ""
             elif mime == "image/gif":
                 file_id = result.get("animation", {}).get("file_id", "")
+            elif is_image:
+                photos = result.get("photo", [])
+                file_id = photos[-1]["file_id"] if photos else ""
             else:
                 file_id = result.get("document", {}).get("file_id", "")
 
@@ -338,6 +358,7 @@ class TelegramMediaStore:
         metadata: Optional[Dict[str, Any]] = None,
         caption: str = "",
         _hash: Optional[str] = None,
+        as_document: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Upload a file using pyrogram/MTProto (no size limit).
 
@@ -372,7 +393,8 @@ class TelegramMediaStore:
         mime, _ = mimetypes.guess_type(str(filepath))
         if not mime:
             mime = "application/octet-stream"
-        is_video = mime.startswith("video/")
+        # Documents are stored byte-for-byte; send_video may transcode.
+        is_video = mime.startswith("video/") and not as_document
 
         client = self._get_pyro_client()
 
