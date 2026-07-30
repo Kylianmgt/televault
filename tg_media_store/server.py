@@ -54,6 +54,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 try:
     from PIL import Image, ImageFile
@@ -627,11 +628,21 @@ async def api_ingest_url(request: Request, _auth: bool = Depends(_require_auth))
         raise HTTPException(503, detail="CHANNEL_ID not set — check your .env file")
 
     body = await request.json()
+
+    # The work below is entirely blocking — multi-hundred-MB downloads, and an
+    # MTProto upload that spins up its own event loop. Running it inline would
+    # stall every other request for the duration, and the nested loop would
+    # simply fail. A worker thread gives it a thread without a running loop.
+    return await run_in_threadpool(_ingest_urls, body)
+
+
+def _ingest_urls(body: Any) -> dict:
+    """Blocking implementation of :func:`api_ingest_url`. Runs off the loop."""
     items = body if isinstance(body, list) else [body]
     if not items:
         return {"added": 0, "skipped": 0, "failed": 0, "results": []}
 
-    from .client import TelegramMediaStore
+    from .client import LARGE_FILE_THRESHOLD, TelegramMediaStore
 
     store = TelegramMediaStore(
         bot_token=BOT_TOKEN,
@@ -672,6 +683,23 @@ async def api_ingest_url(request: Request, _auth: bool = Depends(_require_auth))
                             for chunk in resp.iter_content(chunk_size=1 << 20):
                                 if chunk:
                                     fh.write(chunk)
+
+                    # A file too big for the Bot API with no MTProto configured
+                    # can never upload. Say so, instead of a bare "upload
+                    # failed" that gives the caller nothing to act on.
+                    size = tmp_path.stat().st_size
+                    if size > LARGE_FILE_THRESHOLD and not store.has_pyrogram:
+                        failed += 1
+                        results.append({
+                            "url": url,
+                            "ok": False,
+                            "error": (
+                                f"file is {size / 1048576:.1f} MB; the Bot API caps uploads at "
+                                f"{LARGE_FILE_THRESHOLD // 1048576} MB. Set TG_API_ID/TG_API_HASH "
+                                "and install pyrofork to store files this large."
+                            ),
+                        })
+                        continue
 
                     result = store.upload_file(
                         str(tmp_path),

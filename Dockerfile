@@ -6,7 +6,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# pyrofork/tgcrypto enable the MTProto path. Without them the Bot API caps
+# transfers at 50 MB, so anything larger fails to store — which for a media
+# vault is most videos. They are only useful when TG_API_ID/TG_API_HASH are set.
+RUN pip install --no-cache-dir -r requirements.txt pyrofork tgcrypto
 
 COPY . .
 RUN pip install --no-cache-dir -e .

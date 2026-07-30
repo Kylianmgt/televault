@@ -77,6 +77,26 @@ def file_sha256(filepath: Union[str, Path]) -> str:
     return h.hexdigest()
 
 
+def _extract_file_id(result: Dict[str, Any]) -> str:
+    """Pull the file_id out of a sendX response, whatever kind Telegram chose.
+
+    The response key does not have to match the method used: an MP4 sent via
+    ``sendDocument`` comes back under ``video``, and an image sent as a document
+    may come back under ``document``. Inferring the key from the request is
+    therefore wrong and silently discards successful uploads, so probe the
+    response instead.
+    """
+    for key in ("document", "video", "animation", "audio", "voice", "video_note"):
+        file_id = (result.get(key) or {}).get("file_id")
+        if file_id:
+            return file_id
+    # Photos come back as a size ladder; the last entry is the largest.
+    photos = result.get("photo") or []
+    if photos:
+        return photos[-1].get("file_id", "")
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
@@ -290,11 +310,6 @@ class TelegramMediaStore:
                 time.sleep(retry_after)
                 return self.upload_file(filepath, metadata, caption, as_document)
 
-            # Which kind of message Telegram actually accepted. The dimension
-            # fallback below changes it, and the file_id lives under a different
-            # key per kind — reading the wrong one loses a successful upload.
-            sent_as_document = as_document or not (is_video or is_image)
-
             if r.status_code == 400 and is_image and "PHOTO_INVALID_DIMENSIONS" in (r.text or ""):
                 # Retry as document
                 with open(filepath, "rb") as f2:
@@ -304,25 +319,13 @@ class TelegramMediaStore:
                         data={"chat_id": self.channel_id, "caption": caption[:1024]},
                         timeout=300,
                     )
-                sent_as_document = True
 
             if r.status_code != 200:
                 return None
 
             result = r.json()["result"]
             message_id = result["message_id"]
-
-            if sent_as_document:
-                file_id = result.get("document", {}).get("file_id", "")
-            elif is_video:
-                file_id = result.get("video", {}).get("file_id", "")
-            elif mime == "image/gif":
-                file_id = result.get("animation", {}).get("file_id", "")
-            elif is_image:
-                photos = result.get("photo", [])
-                file_id = photos[-1]["file_id"] if photos else ""
-            else:
-                file_id = result.get("document", {}).get("file_id", "")
+            file_id = _extract_file_id(result)
 
             if not file_id:
                 return None

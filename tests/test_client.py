@@ -249,3 +249,51 @@ class TestLosslessUpload:
         assert result is not None
         assert result["file_id"] == "fallback_doc"
         assert result["message_id"] == 9
+
+
+class TestFileIdExtraction:
+    """Telegram's response key need not match the method used: an MP4 sent via
+    sendDocument comes back under `video`. Inferring the key from the request
+    silently discarded successful uploads."""
+
+    def test_mp4_sent_as_document_returns_video_key(self) -> None:
+        from tg_media_store.client import _extract_file_id
+        assert _extract_file_id({"video": {"file_id": "vid"}}) == "vid"
+
+    def test_document_key(self) -> None:
+        from tg_media_store.client import _extract_file_id
+        assert _extract_file_id({"document": {"file_id": "doc"}}) == "doc"
+
+    def test_animation_key(self) -> None:
+        from tg_media_store.client import _extract_file_id
+        assert _extract_file_id({"animation": {"file_id": "anim"}}) == "anim"
+
+    def test_photo_ladder_takes_largest(self) -> None:
+        from tg_media_store.client import _extract_file_id
+        result = {"photo": [{"file_id": "small"}, {"file_id": "large"}]}
+        assert _extract_file_id(result) == "large"
+
+    def test_unknown_shape_returns_empty(self) -> None:
+        from tg_media_store.client import _extract_file_id
+        assert _extract_file_id({"message_id": 1}) == ""
+
+    def test_null_valued_key_does_not_crash(self) -> None:
+        from tg_media_store.client import _extract_file_id
+        assert _extract_file_id({"document": None, "video": {"file_id": "v"}}) == "v"
+
+    @patch("tg_media_store.client.requests.post")
+    def test_video_as_document_upload_succeeds_end_to_end(
+        self, mock_post: MagicMock, store: TelegramMediaStore, tmp_path: Path
+    ) -> None:
+        """Regression: this returned None before, losing a stored file."""
+        clip = tmp_path / "clip.mp4"
+        clip.write_bytes(b"\x00\x01\x02fake-mp4-payload")
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"ok": True, "result": {"message_id": 55, "video": {"file_id": "vid_id"}}},
+        )
+        result = store.upload_file(clip, as_document=True)
+
+        assert result is not None
+        assert result["file_id"] == "vid_id"
+        assert result["message_id"] == 55
