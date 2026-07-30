@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import sqlite3
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 # Optional pyrogram import
 try:
@@ -351,8 +354,11 @@ class TelegramMediaStore:
             }
 
         except requests.exceptions.Timeout:
+            logger.warning("Bot API upload timed out: %s", filepath.name)
             return None
         except Exception:
+            # Callers only see None, so without this the cause is unrecoverable.
+            logger.exception("Bot API upload failed: %s", filepath.name)
             return None
 
     def upload_large_file(
@@ -453,6 +459,9 @@ class TelegramMediaStore:
                 "message_id": message_id,
             }
         except Exception:
+            # The MTProto path is the only route for files over the Bot API's
+            # 50 MB limit; a silent None here looks identical to "too big".
+            logger.exception("MTProto upload failed: %s", filepath.name)
             return None
 
     def upload_directory(
