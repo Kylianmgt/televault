@@ -6,15 +6,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-# pyrofork enables the MTProto path. Without it the Bot API caps transfers at
-# 50 MB, so anything larger cannot be stored — which for a media vault is most
-# videos. Only useful when TG_API_ID/TG_API_HASH are set.
+# pyrofork enables the MTProto path, which is the only route for files above the
+# Bot API's 50 MB limit — for a media vault, most videos.
 #
-# tgcrypto is deliberately NOT installed: it is a C extension and this image has
-# no compiler, so adding it fails the build with "gcc: No such file or
-# directory". Pyrofork falls back to pure-Python AES, which is slower but
-# correct; adding a toolchain just for faster crypto is not worth the image size.
-RUN pip install --no-cache-dir -r requirements.txt pyrofork
+# tgcrypto is not optional in practice. It is a C extension, and without it
+# pyrofork falls back to pure-Python AES: a 60 MB upload then takes well over
+# ten minutes and times out the caller, which is indistinguishable from being
+# broken. The toolchain is installed only to build the wheel and purged in the
+# same layer, so the runtime image keeps the compiled .so and not the compiler.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && pip install --no-cache-dir -r requirements.txt pyrofork tgcrypto \
+    && apt-get purge -y --auto-remove gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 RUN pip install --no-cache-dir -e .
