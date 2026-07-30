@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -147,6 +148,63 @@ def make_video_poster(filepath: Union[str, Path], dest: Union[str, Path]) -> boo
     return dest.exists() and 0 < dest.stat().st_size
 
 
+class _MTProtoRunner:
+    """Owns one event loop on one thread, for the lifetime of the process.
+
+    Pyrogram binds a client to the loop it was started on. Creating a fresh loop
+    and client per upload — which is what happens when each request is handled
+    in a worker thread — does not raise; it simply never completes, so uploads
+    hang forever and look like a stall rather than a failure.
+
+    One long-lived loop avoids that: coroutines are submitted to it from any
+    thread and awaited with a timeout, so a wedged transfer surfaces as an error
+    instead of silence.
+    """
+
+    def __init__(self) -> None:
+        self._loop: Any = None
+        self._thread: Any = None
+        self._lock = threading.Lock()
+
+    def _ensure(self) -> Any:
+        with self._lock:
+            if self._loop is not None and self._thread and self._thread.is_alive():
+                return self._loop
+            import asyncio
+
+            loop = asyncio.new_event_loop()
+
+            def run() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            thread = threading.Thread(target=run, name="mtproto-loop", daemon=True)
+            thread.start()
+            self._loop, self._thread = loop, thread
+            return loop
+
+    def run(self, coro_factory: Any, timeout: float) -> Any:
+        """Run a coroutine on the dedicated loop and wait for its result."""
+        import asyncio
+
+        loop = self._ensure()
+        future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+        try:
+            return future.result(timeout=timeout)
+        except Exception:
+            future.cancel()
+            raise
+
+
+_MTPROTO = _MTProtoRunner()
+_SHARED_PYRO_CLIENT: Any = None
+_SHARED_PYRO_LOCK = threading.Lock()
+
+# A large upload is slow but not unbounded; past this it is wedged, and saying
+# so beats occupying a worker forever.
+MTPROTO_UPLOAD_TIMEOUT = float(os.environ.get("TG_STORE_MTPROTO_TIMEOUT", "1800"))
+
+
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
@@ -203,7 +261,11 @@ class TelegramMediaStore:
         return HAS_PYROGRAM and bool(self.api_id) and bool(self.api_hash)
 
     def _get_pyro_client(self) -> Any:
-        """Lazily create a pyrogram client (not started).
+        """Return the process-wide pyrogram client, creating it once.
+
+        Shared deliberately: a client belongs to the loop it started on, and the
+        server builds a fresh store per ingest item. Creating a client each time
+        meant a new one per upload, which is what left transfers hanging.
 
         Uses in-memory session storage on purpose. The previous on-disk session
         was a single SQLite file shared by every client this class creates, so
@@ -215,18 +277,20 @@ class TelegramMediaStore:
         Nothing is lost by not persisting it: a bot authenticates from its token
         on connect, so there is no login state worth keeping between runs.
         """
+        global _SHARED_PYRO_CLIENT
         if not self.has_pyrogram:
             return None
-        if self._pyro_client is None:
-            self._pyro_client = PyroClient(
-                "tg_media_store",
-                api_id=self.api_id,
-                api_hash=self.api_hash,
-                bot_token=self.bot_token,
-                no_updates=True,
-                in_memory=True,
-            )
-        return self._pyro_client
+        with _SHARED_PYRO_LOCK:
+            if _SHARED_PYRO_CLIENT is None:
+                _SHARED_PYRO_CLIENT = PyroClient(
+                    "tg_media_store",
+                    api_id=self.api_id,
+                    api_hash=self.api_hash,
+                    bot_token=self.bot_token,
+                    no_updates=True,
+                    in_memory=True,
+                )
+            return _SHARED_PYRO_CLIENT
 
     # ------------------------------------------------------------------
     # Database
@@ -515,7 +579,12 @@ class TelegramMediaStore:
             return thumbs[-1].file_id if thumbs else ""
 
         async def _upload() -> tuple:
-            async with client:
+            # Started once and left connected: `async with` would disconnect
+            # after every file, and reconnecting per upload is what this shared
+            # client exists to avoid.
+            if not client.is_connected:
+                await client.start()
+            if True:
                 channel_id = int(self.channel_id)
                 if is_video:
                     msg = await client.send_video(
@@ -540,13 +609,13 @@ class TelegramMediaStore:
                 return msg.id, fid, tid
 
         try:
-            loop = asyncio.new_event_loop()
             try:
-                message_id, file_id, thumb_file_id = loop.run_until_complete(_upload())
+                message_id, file_id, thumb_file_id = _MTPROTO.run(
+                    _upload, timeout=MTPROTO_UPLOAD_TIMEOUT
+                )
             finally:
-                loop.close()
-                # Reset client so a fresh one is created next time
-                self._pyro_client = None
+                # The client is bound to the shared loop; keep it for reuse.
+                pass
 
             if not file_id:
                 return None
