@@ -21,6 +21,7 @@ import json
 import os
 import secrets
 import sqlite3
+import subprocess
 import tempfile
 import threading
 from io import BytesIO
@@ -431,7 +432,9 @@ def thumb(msg_id: int, _auth: bool = Depends(_require_auth)):
     except Exception:
         raise HTTPException(502)
 
-    if HAS_PIL and (row["mime_type"] or "").startswith("image/"):
+    mime = row["mime_type"] or ""
+
+    if HAS_PIL and mime.startswith("image/"):
         try:
             im = Image.open(BytesIO(content)).convert("RGB")
             im.thumbnail((420, 420))
@@ -440,8 +443,37 @@ def thumb(msg_id: int, _auth: bool = Depends(_require_auth)):
         except Exception:
             pass
 
-    # Fallback: return raw content (or placeholder)
-    return Response(content, media_type=row["mime_type"] or "application/octet-stream")
+    if mime.startswith("video/"):
+        # Grab a frame with ffmpeg (shipped in the image). Without this the
+        # endpoint used to fall through and return the whole video file as the
+        # "thumbnail", so any client putting this URL in an <img> rendered a
+        # broken image while downloading several MB to do it.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src = Path(tmp_dir) / "input"
+            src.write_bytes(content)
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg", "-loglevel", "error", "-y",
+                        # -ss after -i is slower but accurate, and tolerates
+                        # clips shorter than the seek point.
+                        "-i", str(src), "-frames:v", "1",
+                        "-vf", "thumbnail,scale=420:-2",
+                        "-f", "image2", str(thumb_path),
+                    ],
+                    check=True, timeout=120,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                thumb_path.unlink(missing_ok=True)
+            else:
+                if thumb_path.exists() and thumb_path.stat().st_size > 0:
+                    return Response(thumb_path.read_bytes(), media_type="image/jpeg")
+
+    # No thumbnail could be produced. Returning the original here would hand an
+    # <img> tag a multi-megabyte non-image, so report it as missing and let the
+    # client show its own placeholder.
+    raise HTTPException(404, detail="no thumbnail available")
 
 
 @app.get("/stream/{msg_id}")

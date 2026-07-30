@@ -3,7 +3,7 @@
 import pathlib
 import sqlite3
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -415,3 +415,87 @@ class TestHealthz:
         with patch.object(srv, "_db", side_effect=sqlite3.OperationalError("locked")):
             r = client.get("/healthz")
         assert r.status_code == 503
+
+
+class TestThumbnails:
+    """A thumbnail endpoint must return an image or 404 — never the original
+    file. Returning a multi-MB MP4 made every video render as a broken <img>."""
+
+    def _asset(self, test_db: Path, msg_id: int, mime: str, name: str) -> None:
+        conn = sqlite3.connect(str(test_db))
+        conn.execute(
+            "INSERT INTO assets (file_hash, filename, file_size, mime_type, telegram_file_id, telegram_message_id, channel_id, uploaded_at) VALUES (?,?,?,?,?,?,?,?)",
+            (f"h{msg_id}", name, 4_000_000, mime, f"fid_{msg_id}", msg_id, "-100123", "2026-07-30T00:00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_video_without_ffmpeg_success_returns_404_not_the_video(
+        self, client: TestClient, test_db: Path
+    ) -> None:
+        import tg_media_store.server as srv
+        self._asset(test_db, 4001, "video/mp4", "clip.mp4")
+        original = srv.BOT_TOKEN
+        srv.BOT_TOKEN = "tok"
+        try:
+            with patch.object(srv, "requests") as rq:
+                rq.get.return_value = MagicMock(
+                    status_code=200,
+                    json=lambda: {"result": {"file_path": "videos/clip.mp4"}},
+                    content=b"not-a-real-mp4",
+                )
+                # ffmpeg cannot make a frame from this, so no thumbnail exists
+                with patch.object(srv.subprocess, "run", side_effect=OSError("no ffmpeg")):
+                    r = client.get("/thumb/4001")
+            assert r.status_code == 404
+            assert "video" not in r.headers.get("content-type", "")
+        finally:
+            srv.BOT_TOKEN = original
+
+    def test_video_thumbnail_served_as_jpeg_when_ffmpeg_succeeds(
+        self, client: TestClient, test_db: Path
+    ) -> None:
+        import tg_media_store.server as srv
+        self._asset(test_db, 4002, "video/mp4", "clip2.mp4")
+        original = srv.BOT_TOKEN
+        srv.BOT_TOKEN = "tok"
+
+        def fake_run(cmd, **kwargs):
+            # ffmpeg writes its output to the last argument
+            Path(cmd[-1]).write_bytes(b"\xff\xd8\xff-jpeg-bytes")
+            return MagicMock(returncode=0)
+
+        try:
+            with patch.object(srv, "requests") as rq:
+                rq.get.return_value = MagicMock(
+                    status_code=200,
+                    json=lambda: {"result": {"file_path": "videos/clip2.mp4"}},
+                    content=b"fake-mp4",
+                )
+                with patch.object(srv.subprocess, "run", side_effect=fake_run):
+                    r = client.get("/thumb/4002")
+            assert r.status_code == 200
+            assert r.headers["content-type"] == "image/jpeg"
+            assert r.content.startswith(b"\xff\xd8\xff")
+        finally:
+            srv.BOT_TOKEN = original
+
+    def test_unknown_type_returns_404_rather_than_raw_bytes(
+        self, client: TestClient, test_db: Path
+    ) -> None:
+        import tg_media_store.server as srv
+        self._asset(test_db, 4003, "application/zip", "archive.zip")
+        original = srv.BOT_TOKEN
+        srv.BOT_TOKEN = "tok"
+        try:
+            with patch.object(srv, "requests") as rq:
+                rq.get.return_value = MagicMock(
+                    status_code=200,
+                    json=lambda: {"result": {"file_path": "docs/archive.zip"}},
+                    content=b"PK\x03\x04payload",
+                )
+                r = client.get("/thumb/4003")
+            assert r.status_code == 404
+            assert b"payload" not in r.content
+        finally:
+            srv.BOT_TOKEN = original
