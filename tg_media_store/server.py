@@ -20,10 +20,12 @@ import base64
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -249,6 +251,12 @@ async def startup() -> None:
     global _pyro_ready
     _load_json_index()
 
+    # A container that was killed mid-ingest leaves its scratch files behind.
+    reclaimed = sweep_ingest_temp(max_age_seconds=0)
+    if reclaimed:
+        logger.info("reclaimed %d stale ingest directories", reclaimed)
+    trim_thumbnail_cache()
+
     # Start pyrogram if configured
     pyro = _get_pyro_client()
     if pyro:
@@ -446,6 +454,7 @@ def thumb(msg_id: int, _auth: bool = Depends(_require_auth)):
                 ).content
                 if data:
                     thumb_path.write_bytes(data)
+                    trim_thumbnail_cache()
                     return Response(data, media_type="image/jpeg")
         except Exception:
             logger.warning("Telegram thumbnail fetch failed for %s", msg_id, exc_info=True)
@@ -699,6 +708,75 @@ async def api_ingest_url(request: Request, _auth: bool = Depends(_require_auth))
 
 INGEST_CONCURRENCY = max(1, int(os.environ.get("TG_STORE_INGEST_CONCURRENCY", "3")))
 
+# Ingest downloads a file to disk before handing it to Telegram. That scratch
+# space is the one place this service can fill a disk, so it is bounded three
+# ways: a dedicated directory that can be swept, a floor on free space, and a
+# ceiling on any single download.
+INGEST_TMP_ROOT = Path(os.environ.get("TG_STORE_TMP", "/tmp/televault-ingest"))
+MIN_FREE_BYTES = int(os.environ.get("TG_STORE_MIN_FREE_MB", "2048")) * 1024 * 1024
+MAX_DOWNLOAD_BYTES = int(os.environ.get("TG_STORE_MAX_DOWNLOAD_MB", "2048")) * 1024 * 1024
+THUMBS_MAX_BYTES = int(os.environ.get("TG_STORE_THUMBS_MAX_MB", "512")) * 1024 * 1024
+
+
+def _free_bytes() -> int:
+    """Bytes available on the filesystem holding the scratch directory."""
+    try:
+        INGEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        return shutil.disk_usage(INGEST_TMP_ROOT).free
+    except Exception:
+        # If we cannot tell, do not block ingest on a guess.
+        return MIN_FREE_BYTES
+
+
+def sweep_ingest_temp(max_age_seconds: int = 1800) -> int:
+    """Delete scratch directories left behind by interrupted ingests.
+
+    A download that is killed mid-flight — a timed-out request, a container
+    stop — never runs TemporaryDirectory's cleanup, so its partial file stays.
+    At ~100 MB per large video that fills a disk quickly. Only this service's
+    own directory is touched, never the system temp root.
+    """
+    removed = 0
+    try:
+        INGEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - max_age_seconds
+        for child in INGEST_TMP_ROOT.iterdir():
+            try:
+                if child.is_dir() and child.stat().st_mtime < cutoff:
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                continue
+    except Exception:
+        logger.warning("ingest temp sweep failed", exc_info=True)
+    return removed
+
+
+def trim_thumbnail_cache() -> int:
+    """Keep the thumbnail cache under its budget, oldest evicted first.
+
+    Thumbnails are small but unbounded — one per asset, forever. They are
+    regenerated on demand, so evicting them costs a fetch, not data.
+    """
+    removed = 0
+    try:
+        files = [(f, f.stat()) for f in THUMBS_DIR.glob("*.jpg") if f.is_file()]
+        total = sum(st.st_size for _, st in files)
+        if total <= THUMBS_MAX_BYTES:
+            return 0
+        for f, st in sorted(files, key=lambda pair: pair[1].st_mtime):
+            if total <= THUMBS_MAX_BYTES:
+                break
+            try:
+                f.unlink()
+                total -= st.st_size
+                removed += 1
+            except OSError:
+                continue
+    except Exception:
+        logger.warning("thumbnail cache trim failed", exc_info=True)
+    return removed
+
 
 def _ingest_one(item: Any, store_factory: Any) -> dict:
     """Fetch one URL and store it. Returns a per-item result dict.
@@ -724,15 +802,39 @@ def _ingest_one(item: Any, store_factory: Any) -> dict:
         # Download into a temp *directory* under the intended filename: the
         # upload path records `filepath.name` as the asset filename, so a
         # NamedTemporaryFile would immortalise its own "tmpab12cd_" prefix.
+        # Refuse rather than fill the disk. Scratch space is the only place this
+        # service grows, and an ingest that runs the volume dry takes the whole
+        # container with it.
+        if _free_bytes() < MIN_FREE_BYTES:
+            return {
+                "url": url,
+                "ok": False,
+                "error": (
+                    f"refusing to download: less than {MIN_FREE_BYTES // 1048576} MB free on "
+                    "the scratch volume"
+                ),
+            }
+
         try:
-            with tempfile.TemporaryDirectory() as tmp_dir:
+            INGEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=str(INGEST_TMP_ROOT)) as tmp_dir:
                 tmp_path = Path(tmp_dir) / Path(name).name
                 with requests.get(url, stream=True, timeout=120) as resp:
                     resp.raise_for_status()
+                    written = 0
                     with open(tmp_path, "wb") as fh:
                         for chunk in resp.iter_content(chunk_size=1 << 20):
-                            if chunk:
-                                fh.write(chunk)
+                            if not chunk:
+                                continue
+                            written += len(chunk)
+                            # Enforced while streaming, not from Content-Length,
+                            # which a server may omit or understate.
+                            if written > MAX_DOWNLOAD_BYTES:
+                                raise ValueError(
+                                    f"exceeds the {MAX_DOWNLOAD_BYTES // 1048576} MB "
+                                    "per-file download limit"
+                                )
+                            fh.write(chunk)
 
                 # A file too big for the Bot API with no MTProto configured can
                 # never upload. Say so, instead of a bare "upload failed" that
@@ -802,6 +904,9 @@ def _ingest_urls(body: Any) -> dict:
     items = body if isinstance(body, list) else [body]
     if not items:
         return {"added": 0, "skipped": 0, "failed": 0, "results": []}
+
+    # Reclaim anything a previously interrupted batch left behind.
+    sweep_ingest_temp()
 
     from .client import TelegramMediaStore
 

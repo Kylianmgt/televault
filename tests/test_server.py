@@ -672,3 +672,99 @@ class TestTelegramNativeThumbnail:
             assert {"file_id": "orig2"} in asked
         finally:
             srv.BOT_TOKEN = original
+
+
+class TestDiskGuards:
+    """Scratch space is the only place this service grows. An ingest that runs
+    the volume dry takes the container with it, so the limits are load-bearing."""
+
+    def test_sweep_removes_stale_dirs_but_keeps_fresh_ones(self, tmp_path: Path) -> None:
+        import os as _os
+        import time as _time
+        import tg_media_store.server as srv
+        original = srv.INGEST_TMP_ROOT
+        srv.INGEST_TMP_ROOT = tmp_path / "ingest"
+        srv.INGEST_TMP_ROOT.mkdir()
+        try:
+            stale = srv.INGEST_TMP_ROOT / "stale"
+            stale.mkdir()
+            (stale / "big.bin").write_bytes(b"x" * 1024)
+            _os.utime(stale, (_time.time() - 7200, _time.time() - 7200))
+
+            fresh = srv.INGEST_TMP_ROOT / "fresh"
+            fresh.mkdir()
+            (fresh / "wip.bin").write_bytes(b"y" * 1024)
+
+            removed = srv.sweep_ingest_temp(max_age_seconds=1800)
+            assert removed == 1
+            assert not stale.exists(), "stale scratch dir survived"
+            assert fresh.exists(), "swept away an in-flight download"
+        finally:
+            srv.INGEST_TMP_ROOT = original
+
+    def test_sweep_never_touches_the_system_temp_root(self, tmp_path: Path) -> None:
+        import tg_media_store.server as srv
+        # The sweep must be scoped to our own directory, never /tmp at large.
+        assert "televault" in str(srv.INGEST_TMP_ROOT).lower()
+
+    def test_refuses_to_download_when_disk_is_low(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        orig = (srv.BOT_TOKEN, srv.CHANNEL_ID)
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+        try:
+            with patch.object(srv, "_free_bytes", return_value=1024):
+                r = client.post("/api/ingest-url", json={"url": "https://e.test/a.mp4"})
+            body = r.json()
+            assert body["failed"] == 1
+            assert "free" in body["results"][0]["error"]
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+    def test_download_over_the_cap_is_aborted(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        orig = (srv.BOT_TOKEN, srv.CHANNEL_ID, srv.MAX_DOWNLOAD_BYTES)
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+        srv.MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024
+
+        class Endless:
+            headers: dict = {}
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def raise_for_status(self): return None
+            def iter_content(self, chunk_size=0):
+                # No Content-Length; the cap must hold on the stream itself.
+                for _ in range(10):
+                    yield b"z" * (1024 * 1024)
+
+        try:
+            with patch("tg_media_store.client.TelegramMediaStore"):
+                with patch.object(srv.requests, "get", return_value=Endless()):
+                    r = client.post("/api/ingest-url", json={"url": "https://e.test/huge.mp4"})
+            body = r.json()
+            assert body["failed"] == 1
+            assert "download limit" in body["results"][0]["error"]
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID, srv.MAX_DOWNLOAD_BYTES = orig
+
+    def test_thumbnail_cache_is_trimmed_oldest_first(self, tmp_path: Path) -> None:
+        import os as _os
+        import time as _time
+        import tg_media_store.server as srv
+        orig = (srv.THUMBS_DIR, srv.THUMBS_MAX_BYTES)
+        srv.THUMBS_DIR = tmp_path / "thumbs"
+        srv.THUMBS_DIR.mkdir()
+        srv.THUMBS_MAX_BYTES = 3000
+        try:
+            for i, age in enumerate([5000, 4000, 100]):
+                f = srv.THUMBS_DIR / f"t{i}.jpg"
+                f.write_bytes(b"x" * 2000)
+                _os.utime(f, (_time.time() - age, _time.time() - age))
+
+            removed = srv.trim_thumbnail_cache()
+            assert removed >= 1
+            # newest survives
+            assert (srv.THUMBS_DIR / "t2.jpg").exists()
+            # oldest evicted first
+            assert not (srv.THUMBS_DIR / "t0.jpg").exists()
+        finally:
+            srv.THUMBS_DIR, srv.THUMBS_MAX_BYTES = orig
