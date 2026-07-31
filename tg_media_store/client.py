@@ -200,6 +200,33 @@ _MTPROTO = _MTProtoRunner()
 _SHARED_PYRO_CLIENT: Any = None
 _SHARED_PYRO_LOCK = threading.Lock()
 
+# Created lazily on the shared loop — asyncio primitives bind to a loop, so they
+# cannot be built at import time.
+_START_LOCK: Any = None
+_SEND_SEM: Any = None
+
+# One large transfer at a time by default. These are bandwidth-bound, so running
+# them in parallel buys nothing and empirically wedges the session.
+MTPROTO_PARALLEL = max(1, int(os.environ.get("TG_STORE_MTPROTO_PARALLEL", "1")))
+
+
+def _mtproto_start_lock() -> Any:
+    global _START_LOCK
+    import asyncio
+
+    if _START_LOCK is None:
+        _START_LOCK = asyncio.Lock()
+    return _START_LOCK
+
+
+def _mtproto_send_slot() -> Any:
+    global _SEND_SEM
+    import asyncio
+
+    if _SEND_SEM is None:
+        _SEND_SEM = asyncio.Semaphore(MTPROTO_PARALLEL)
+    return _SEND_SEM
+
 # A large upload is slow but not unbounded; past this it is wedged, and saying
 # so beats occupying a worker forever.
 MTPROTO_UPLOAD_TIMEOUT = float(os.environ.get("TG_STORE_MTPROTO_TIMEOUT", "1800"))
@@ -582,9 +609,17 @@ class TelegramMediaStore:
             # Started once and left connected: `async with` would disconnect
             # after every file, and reconnecting per upload is what this shared
             # client exists to avoid.
-            if not client.is_connected:
-                await client.start()
-            if True:
+            #
+            # Both guards below matter under concurrency. Without the start
+            # lock, several uploads can each see a disconnected client and call
+            # start() at the same time. Without the semaphore, they interleave
+            # large transfers on one session, which wedges rather than sharing
+            # bandwidth — a single upload driven on its own completes fine.
+            async with _mtproto_start_lock():
+                if not client.is_connected:
+                    await client.start()
+
+            async with _mtproto_send_slot():
                 channel_id = int(self.channel_id)
                 if is_video:
                     msg = await client.send_video(
