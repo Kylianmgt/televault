@@ -20,6 +20,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -148,85 +149,6 @@ def make_video_poster(filepath: Union[str, Path], dest: Union[str, Path]) -> boo
     return dest.exists() and 0 < dest.stat().st_size
 
 
-class _MTProtoRunner:
-    """Owns one event loop on one thread, for the lifetime of the process.
-
-    Pyrogram binds a client to the loop it was started on. Creating a fresh loop
-    and client per upload — which is what happens when each request is handled
-    in a worker thread — does not raise; it simply never completes, so uploads
-    hang forever and look like a stall rather than a failure.
-
-    One long-lived loop avoids that: coroutines are submitted to it from any
-    thread and awaited with a timeout, so a wedged transfer surfaces as an error
-    instead of silence.
-    """
-
-    def __init__(self) -> None:
-        self._loop: Any = None
-        self._thread: Any = None
-        self._lock = threading.Lock()
-
-    def _ensure(self) -> Any:
-        with self._lock:
-            if self._loop is not None and self._thread and self._thread.is_alive():
-                return self._loop
-            import asyncio
-
-            loop = asyncio.new_event_loop()
-
-            def run() -> None:
-                asyncio.set_event_loop(loop)
-                loop.run_forever()
-
-            thread = threading.Thread(target=run, name="mtproto-loop", daemon=True)
-            thread.start()
-            self._loop, self._thread = loop, thread
-            return loop
-
-    def run(self, coro_factory: Any, timeout: float) -> Any:
-        """Run a coroutine on the dedicated loop and wait for its result."""
-        import asyncio
-
-        loop = self._ensure()
-        future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
-        try:
-            return future.result(timeout=timeout)
-        except Exception:
-            future.cancel()
-            raise
-
-
-_MTPROTO = _MTProtoRunner()
-_SHARED_PYRO_CLIENT: Any = None
-_SHARED_PYRO_LOCK = threading.Lock()
-
-# Created lazily on the shared loop — asyncio primitives bind to a loop, so they
-# cannot be built at import time.
-_START_LOCK: Any = None
-_SEND_SEM: Any = None
-
-# One large transfer at a time by default. These are bandwidth-bound, so running
-# them in parallel buys nothing and empirically wedges the session.
-MTPROTO_PARALLEL = max(1, int(os.environ.get("TG_STORE_MTPROTO_PARALLEL", "1")))
-
-
-def _mtproto_start_lock() -> Any:
-    global _START_LOCK
-    import asyncio
-
-    if _START_LOCK is None:
-        _START_LOCK = asyncio.Lock()
-    return _START_LOCK
-
-
-def _mtproto_send_slot() -> Any:
-    global _SEND_SEM
-    import asyncio
-
-    if _SEND_SEM is None:
-        _SEND_SEM = asyncio.Semaphore(MTPROTO_PARALLEL)
-    return _SEND_SEM
-
 # A large upload is slow but not unbounded; past this it is wedged, and saying
 # so beats occupying a worker forever.
 MTPROTO_UPLOAD_TIMEOUT = float(os.environ.get("TG_STORE_MTPROTO_TIMEOUT", "1800"))
@@ -288,36 +210,23 @@ class TelegramMediaStore:
         return HAS_PYROGRAM and bool(self.api_id) and bool(self.api_hash)
 
     def _get_pyro_client(self) -> Any:
-        """Return the process-wide pyrogram client, creating it once.
+        """Kept for callers that drive pyrogram themselves.
 
-        Shared deliberately: a client belongs to the loop it started on, and the
-        server builds a fresh store per ingest item. Creating a client each time
-        meant a new one per upload, which is what left transfers hanging.
-
-        Uses in-memory session storage on purpose. The previous on-disk session
-        was a single SQLite file shared by every client this class creates, so
-        two uploads in the same process — which is the normal case for a server
-        ingesting a batch — raced on it and the loser died with
-        ``sqlite3.OperationalError: database is locked``, failing every file
-        above the Bot API's 50 MB limit.
-
-        Nothing is lost by not persisting it: a bot authenticates from its token
-        on connect, so there is no login state worth keeping between runs.
+        The upload path no longer uses this: it runs pyrogram in a subprocess,
+        because driving it from a worker thread hangs indefinitely.
         """
-        global _SHARED_PYRO_CLIENT
         if not self.has_pyrogram:
             return None
-        with _SHARED_PYRO_LOCK:
-            if _SHARED_PYRO_CLIENT is None:
-                _SHARED_PYRO_CLIENT = PyroClient(
-                    "tg_media_store",
-                    api_id=self.api_id,
-                    api_hash=self.api_hash,
-                    bot_token=self.bot_token,
-                    no_updates=True,
-                    in_memory=True,
-                )
-            return _SHARED_PYRO_CLIENT
+        if self._pyro_client is None:
+            self._pyro_client = PyroClient(
+                "tg_media_store",
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                bot_token=self.bot_token,
+                no_updates=True,
+                in_memory=True,
+            )
+        return self._pyro_client
 
     # ------------------------------------------------------------------
     # Database
@@ -598,61 +507,38 @@ class TelegramMediaStore:
             candidate = Path(poster_dir) / "poster.jpg"
             poster_path = candidate if make_video_poster(filepath, candidate) else None
 
-        client = self._get_pyro_client()
-
-        def _thumb_of(media: Any) -> str:
-            """Telegram's generated preview for a media object, if present."""
-            thumbs = getattr(media, "thumbs", None) or []
-            return thumbs[-1].file_id if thumbs else ""
-
-        async def _upload() -> tuple:
-            # Started once and left connected: `async with` would disconnect
-            # after every file, and reconnecting per upload is what this shared
-            # client exists to avoid.
-            #
-            # Both guards below matter under concurrency. Without the start
-            # lock, several uploads can each see a disconnected client and call
-            # start() at the same time. Without the semaphore, they interleave
-            # large transfers on one session, which wedges rather than sharing
-            # bandwidth — a single upload driven on its own completes fine.
-            async with _mtproto_start_lock():
-                if not client.is_connected:
-                    await client.start()
-
-            async with _mtproto_send_slot():
-                channel_id = int(self.channel_id)
-                if is_video:
-                    msg = await client.send_video(
-                        channel_id, str(filepath),
-                        caption=caption[:1024],
-                        file_name=filepath.name,
-                        supports_streaming=True,
-                    )
-                    fid = msg.video.file_id if msg.video else ""
-                    tid = _thumb_of(msg.video) if msg.video else ""
-                else:
-                    msg = await client.send_document(
-                        channel_id, str(filepath),
-                        caption=caption[:1024],
-                        file_name=filepath.name,
-                        # Same reason as the Bot API path: a document carries no
-                        # preview unless one is supplied.
-                        **({"thumb": str(poster_path)} if poster_path else {}),
-                    )
-                    fid = msg.document.file_id if msg.document else ""
-                    tid = _thumb_of(msg.document) if msg.document else ""
-                return msg.id, fid, tid
+        # Driven in a subprocess on its own main thread. The same call issued
+        # from a worker thread of the server never completes — no error, no
+        # progress — while a dedicated process finishes in seconds. See
+        # tg_media_store/_mtproto_upload.py.
+        job = {
+            "api_id": self.api_id,
+            "api_hash": self.api_hash,
+            "bot_token": self.bot_token,
+            "channel_id": self.channel_id,
+            "path": str(filepath),
+            "caption": caption,
+            "file_name": filepath.name,
+            "as_video": bool(is_video),
+            "thumb": str(poster_path) if poster_path else None,
+        }
 
         try:
-            try:
-                message_id, file_id, thumb_file_id = _MTPROTO.run(
-                    _upload, timeout=MTPROTO_UPLOAD_TIMEOUT
+            proc = subprocess.run(
+                [sys.executable, "-m", "tg_media_store._mtproto_upload", json.dumps(job)],
+                capture_output=True, text=True, timeout=MTPROTO_UPLOAD_TIMEOUT,
+            )
+            payload = json.loads((proc.stdout or "").strip().splitlines()[-1])
+            if not payload.get("ok"):
+                logger.error(
+                    "MTProto upload failed: %s — %s", filepath.name, payload.get("error")
                 )
-            finally:
-                # The client is bound to the shared loop; keep it for reuse.
-                pass
-
+                return None
+            message_id = payload["message_id"]
+            file_id = payload.get("file_id") or ""
+            thumb_file_id = payload.get("thumb_file_id") or ""
             if not file_id:
+                logger.error("MTProto upload returned no file_id: %s", filepath.name)
                 return None
 
             meta_json = json.dumps(metadata) if metadata else None
@@ -675,9 +561,13 @@ class TelegramMediaStore:
                 "file_id": file_id,
                 "message_id": message_id,
             }
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "MTProto upload timed out after %ss: %s",
+                MTPROTO_UPLOAD_TIMEOUT, filepath.name,
+            )
+            return None
         except Exception:
-            # The MTProto path is the only route for files over the Bot API's
-            # 50 MB limit; a silent None here looks identical to "too big".
             logger.exception("MTProto upload failed: %s", filepath.name)
             return None
         finally:
