@@ -539,6 +539,11 @@ async def stream(msg_id: int, request: Request, _auth: bool = Depends(_require_a
     file_size = row["file_size"] or 0
     mime = row["mime_type"] or "application/octet-stream"
 
+    # ── Cached locally: no Telegram round trip at all ──
+    cached = read_media_cache(msg_id)
+    if cached:
+        return _ranged_file_response(cached, mime, request.headers.get("range"))
+
     # ── Small files: Bot API ──
     if file_size <= 20 * 1024 * 1024:
         try:
@@ -552,6 +557,17 @@ async def stream(msg_id: int, request: Request, _auth: bool = Depends(_require_a
                 range_header = request.headers.get("range")
                 if range_header:
                     headers["Range"] = range_header
+
+                # Fetch once in full and cache it, so this file never costs a
+                # Telegram round trip again — then answer from the cache,
+                # including the range the player actually asked for.
+                if file_size and file_size <= MEDIA_CACHE_MAX_FILE:
+                    whole = requests.get(dl_url, timeout=(10, 180)).content
+                    if whole:
+                        write_media_cache(msg_id, whole)
+                        cached = read_media_cache(msg_id)
+                        if cached:
+                            return _ranged_file_response(cached, mime, range_header)
 
                 upstream = requests.get(dl_url, stream=True, headers=headers, timeout=(10, 120))
 
@@ -743,10 +759,111 @@ def _start_janitor() -> None:
                 if removed:
                     logger.info("janitor reclaimed %d stale ingest directories", removed)
                 trim_thumbnail_cache()
+                trim_media_cache()
             except Exception:
                 logger.warning("janitor pass failed", exc_info=True)
 
     threading.Thread(target=loop, name="televault-janitor", daemon=True).start()
+
+
+# Media cache. Every stream request otherwise re-fetches from Telegram — two
+# round trips for a small file (getFile, then the CDN) — and pays that again on
+# every replay and every seek. Caching the bytes locally turns a repeat view
+# into a local read. Bounded and LRU-trimmed so it cannot grow without limit.
+MEDIA_CACHE_DIR = Path(os.environ.get("TG_STORE_MEDIA_CACHE", "")) if os.environ.get(
+    "TG_STORE_MEDIA_CACHE"
+) else (DB_PATH.parent / "media-cache")
+MEDIA_CACHE_MAX_BYTES = int(os.environ.get("TG_STORE_MEDIA_CACHE_MB", "4096")) * 1024 * 1024
+# Per-file ceiling: the point is to make the common case instant, not to mirror
+# the archive. Most stored video sits far below this.
+MEDIA_CACHE_MAX_FILE = int(os.environ.get("TG_STORE_MEDIA_CACHE_FILE_MB", "25")) * 1024 * 1024
+
+
+def _cache_path(msg_id: int) -> Path:
+    return MEDIA_CACHE_DIR / f"{msg_id}.bin"
+
+
+def read_media_cache(msg_id: int) -> Optional[Path]:
+    """Return the cached file for *msg_id*, marking it recently used."""
+    path = _cache_path(msg_id)
+    try:
+        if path.is_file() and path.stat().st_size > 0:
+            os.utime(path, None)  # LRU bookkeeping
+            return path
+    except OSError:
+        pass
+    return None
+
+
+def write_media_cache(msg_id: int, data: bytes) -> None:
+    """Store bytes for *msg_id*, if they are worth caching."""
+    if not data or len(data) > MEDIA_CACHE_MAX_FILE:
+        return
+    try:
+        MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _cache_path(msg_id).with_suffix(".part")
+        tmp.write_bytes(data)
+        # Rename last so a reader never sees a half-written file.
+        tmp.replace(_cache_path(msg_id))
+        trim_media_cache()
+    except Exception:
+        # Caching is an optimisation; never fail a request over it.
+        logger.warning("could not cache media %s", msg_id, exc_info=True)
+
+
+def trim_media_cache() -> int:
+    """Evict least-recently-used entries until under budget."""
+    removed = 0
+    try:
+        files = [(f, f.stat()) for f in MEDIA_CACHE_DIR.glob("*.bin") if f.is_file()]
+        total = sum(st.st_size for _, st in files)
+        if total <= MEDIA_CACHE_MAX_BYTES:
+            return 0
+        for f, st in sorted(files, key=lambda pair: pair[1].st_atime):
+            if total <= MEDIA_CACHE_MAX_BYTES:
+                break
+            try:
+                f.unlink()
+                total -= st.st_size
+                removed += 1
+            except OSError:
+                continue
+    except Exception:
+        logger.warning("media cache trim failed", exc_info=True)
+    return removed
+
+
+def _ranged_file_response(path: Path, mime: str, range_header: Optional[str]) -> Response:
+    """Serve a local file, honouring a single byte range so players can seek."""
+    size = path.stat().st_size
+    start, end = 0, size - 1
+    partial = False
+
+    if range_header and range_header.startswith("bytes="):
+        spec = range_header[6:].split(",")[0].strip()
+        first, _, last = spec.partition("-")
+        try:
+            if first:
+                start = int(first)
+                end = int(last) if last else size - 1
+            elif last:  # suffix range: last N bytes
+                start = max(0, size - int(last))
+            partial = True
+        except ValueError:
+            start, end, partial = 0, size - 1, False
+
+    start = max(0, min(start, size - 1))
+    end = max(start, min(end, size - 1))
+    length = end - start + 1
+
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        body = fh.read(length)
+
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(length)}
+    if partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return Response(body, status_code=206 if partial else 200, media_type=mime, headers=headers)
 
 
 def _free_bytes() -> int:

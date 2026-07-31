@@ -802,3 +802,75 @@ class TestDiskGuards:
         import tg_media_store.server as srv
         # min() of the two, so a caller can tighten but never loosen.
         assert min(srv.MAX_DOWNLOAD_BYTES, 999 * 1024**3) == srv.MAX_DOWNLOAD_BYTES
+
+
+class TestMediaCache:
+    """Every stream otherwise re-fetches from Telegram — two round trips for a
+    small file, paid again on every replay and seek."""
+
+    def test_cache_hit_serves_locally(self, tmp_path: Path) -> None:
+        import tg_media_store.server as srv
+        orig = srv.MEDIA_CACHE_DIR
+        srv.MEDIA_CACHE_DIR = tmp_path / "mc"
+        try:
+            srv.write_media_cache(99, b"payload-bytes")
+            hit = srv.read_media_cache(99)
+            assert hit is not None and hit.read_bytes() == b"payload-bytes"
+        finally:
+            srv.MEDIA_CACHE_DIR = orig
+
+    def test_oversized_files_are_not_cached(self, tmp_path: Path) -> None:
+        import tg_media_store.server as srv
+        orig = (srv.MEDIA_CACHE_DIR, srv.MEDIA_CACHE_MAX_FILE)
+        srv.MEDIA_CACHE_DIR = tmp_path / "mc"
+        srv.MEDIA_CACHE_MAX_FILE = 8
+        try:
+            srv.write_media_cache(100, b"way-too-long-for-the-limit")
+            assert srv.read_media_cache(100) is None
+        finally:
+            srv.MEDIA_CACHE_DIR, srv.MEDIA_CACHE_MAX_FILE = orig
+
+    def test_trim_evicts_least_recently_used(self, tmp_path: Path) -> None:
+        import os as _os, time as _time
+        import tg_media_store.server as srv
+        orig = (srv.MEDIA_CACHE_DIR, srv.MEDIA_CACHE_MAX_BYTES)
+        srv.MEDIA_CACHE_DIR = tmp_path / "mc"
+        srv.MEDIA_CACHE_DIR.mkdir()
+        srv.MEDIA_CACHE_MAX_BYTES = 3000
+        try:
+            for i, age in enumerate([9000, 5000, 10]):
+                f = srv.MEDIA_CACHE_DIR / f"{i}.bin"
+                f.write_bytes(b"x" * 2000)
+                _os.utime(f, (_time.time() - age, _time.time() - age))
+            srv.trim_media_cache()
+            assert (srv.MEDIA_CACHE_DIR / "2.bin").exists(), "evicted the freshest entry"
+            assert not (srv.MEDIA_CACHE_DIR / "0.bin").exists(), "kept the stalest entry"
+        finally:
+            srv.MEDIA_CACHE_DIR, srv.MEDIA_CACHE_MAX_BYTES = orig
+
+    def test_range_request_served_from_cache(self, tmp_path: Path) -> None:
+        """Seeking must work off the cached copy, or players re-download."""
+        import tg_media_store.server as srv
+        f = tmp_path / "clip.bin"
+        f.write_bytes(bytes(range(256)))
+        r = srv._ranged_file_response(f, "video/mp4", "bytes=10-19")
+        assert r.status_code == 206
+        assert r.headers["Content-Range"] == "bytes 10-19/256"
+        assert r.body == bytes(range(10, 20))
+
+    def test_full_request_from_cache_is_200_with_accept_ranges(self, tmp_path: Path) -> None:
+        import tg_media_store.server as srv
+        f = tmp_path / "clip.bin"
+        f.write_bytes(b"abcdef")
+        r = srv._ranged_file_response(f, "video/mp4", None)
+        assert r.status_code == 200
+        assert r.headers["Accept-Ranges"] == "bytes"
+        assert r.body == b"abcdef"
+
+    def test_malformed_range_falls_back_to_whole_file(self, tmp_path: Path) -> None:
+        import tg_media_store.server as srv
+        f = tmp_path / "clip.bin"
+        f.write_bytes(b"abcdef")
+        r = srv._ranged_file_response(f, "video/mp4", "bytes=notanumber")
+        assert r.status_code == 200
+        assert r.body == b"abcdef"

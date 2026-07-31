@@ -172,13 +172,29 @@ class TestServerStream:
 
             tc = TestClient(srv.app)
 
+            # Isolate the media cache so the test never writes to a real one.
+            original_cache = srv.MEDIA_CACHE_DIR
+            srv.MEDIA_CACHE_DIR = Path(td) / "media-cache"
+
             with patch("tg_media_store.server.requests.get") as mock_get:
                 mock_get.side_effect = [
                     MagicMock(status_code=200, json=lambda: {"result": {"file_path": "photos/test.jpg"}}),
-                    MagicMock(status_code=200, iter_content=lambda chunk_size: [b"image_data"], headers={}),
+                    # Small files are fetched whole and cached, then served
+                    # from disk — so this is a .content read, not a stream.
+                    MagicMock(status_code=200, content=b"image_data", headers={}),
                 ]
                 r = tc.get("/stream/42")
                 assert r.status_code == 200
+                assert r.content == b"image_data"
+
+            # A second request must not touch Telegram at all.
+            with patch("tg_media_store.server.requests.get") as mock_get2:
+                r2 = tc.get("/stream/42")
+                assert r2.status_code == 200
+                assert r2.content == b"image_data"
+                assert mock_get2.call_count == 0, "cached file still refetched from Telegram"
+
+            srv.MEDIA_CACHE_DIR = original_cache
 
             srv.DB_PATH = original_db
             srv.VIEWER_PASS = original_pass
