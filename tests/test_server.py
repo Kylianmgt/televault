@@ -874,3 +874,120 @@ class TestMediaCache:
         r = srv._ranged_file_response(f, "video/mp4", "bytes=notanumber")
         assert r.status_code == 200
         assert r.body == b"abcdef"
+
+
+class TestApiDeleteMedia:
+    """Deleting an asset must remove the channel copy, the index row, and any
+    cached bytes — a half-delete leaves media still servable or untracked."""
+
+    @staticmethod
+    def _telegram(ok: bool, description: str = ""):
+        """Patch the Bot API call with a canned deleteMessage response."""
+        response = MagicMock()
+        response.status_code = 200 if ok else 400
+        response.json.return_value = (
+            {"ok": True, "result": True} if ok else {"ok": False, "description": description}
+        )
+        return patch("tg_media_store.server.requests.post", return_value=response)
+
+    def test_deletes_row_thumbnail_and_cache(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        orig = srv.BOT_TOKEN, srv.CHANNEL_ID, srv.MEDIA_CACHE_DIR
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+        srv.MEDIA_CACHE_DIR = srv.THUMBS_DIR.parent / "media-cache"
+        srv.MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            srv._thumb_path(101).write_bytes(b"thumb")
+            srv._cache_path(101).write_bytes(b"bytes")
+
+            with self._telegram(True):
+                r = client.delete("/api/media/101")
+
+            assert r.status_code == 200
+            assert r.json()["telegram"]["deleted"] is True
+            assert not srv._thumb_path(101).exists(), "thumbnail outlived the asset"
+            assert not srv._cache_path(101).exists(), "cached bytes outlived the asset"
+
+            listed = client.get("/api/media").json()
+            assert [i["msg_id"] for i in listed["items"]] == [103, 102]
+            assert listed["total"] == 2
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID, srv.MEDIA_CACHE_DIR = orig
+
+    def test_album_membership_goes_with_it(self, client: TestClient, test_db: pathlib.Path) -> None:
+        import tg_media_store.server as srv
+        orig = srv.BOT_TOKEN, srv.CHANNEL_ID
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+        try:
+            with self._telegram(True):
+                assert client.delete("/api/media/101").status_code == 200
+            conn = sqlite3.connect(str(test_db))
+            rows = conn.execute("SELECT * FROM album_assets WHERE asset_id = 1").fetchall()
+            conn.close()
+            assert rows == [], "album still points at a deleted asset"
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+    def test_unknown_asset_is_404(self, client: TestClient) -> None:
+        assert client.delete("/api/media/999").status_code == 404
+
+    def test_telegram_refusal_keeps_the_row(self, client: TestClient) -> None:
+        """Dropping the row anyway would orphan the file in the channel."""
+        import tg_media_store.server as srv
+        orig = srv.BOT_TOKEN, srv.CHANNEL_ID
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+        try:
+            with self._telegram(False, "Bad Request: not enough rights"):
+                r = client.delete("/api/media/101")
+            assert r.status_code == 502
+            assert client.get("/api/media").json()["total"] == 3
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+    def test_force_drops_the_row_despite_refusal(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        orig = srv.BOT_TOKEN, srv.CHANNEL_ID
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+        try:
+            with self._telegram(False, "Bad Request: not enough rights"):
+                r = client.delete("/api/media/101?force=true")
+            assert r.status_code == 200
+            assert r.json()["telegram"]["deleted"] is False
+            assert client.get("/api/media").json()["total"] == 2
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+    def test_already_gone_upstream_counts_as_deleted(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        orig = srv.BOT_TOKEN, srv.CHANNEL_ID
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+        try:
+            with self._telegram(False, "Bad Request: message to delete not found"):
+                r = client.delete("/api/media/101")
+            assert r.status_code == 200
+            assert r.json()["telegram"]["deleted"] is True
+            assert client.get("/api/media").json()["total"] == 2
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+    def test_keep_remote_never_calls_telegram(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        orig = srv.BOT_TOKEN, srv.CHANNEL_ID
+        srv.BOT_TOKEN, srv.CHANNEL_ID = "tok", "-100123"
+        try:
+            with patch("tg_media_store.server.requests.post") as post:
+                r = client.delete("/api/media/101?keep_remote=true")
+            assert r.status_code == 200
+            post.assert_not_called()
+            assert client.get("/api/media").json()["total"] == 2
+        finally:
+            srv.BOT_TOKEN, srv.CHANNEL_ID = orig
+
+    def test_requires_auth(self, client: TestClient) -> None:
+        import tg_media_store.server as srv
+        original = srv.VIEWER_PASS
+        srv.VIEWER_PASS = "s3cret"
+        try:
+            assert client.delete("/api/media/101").status_code == 401
+        finally:
+            srv.VIEWER_PASS = original

@@ -208,6 +208,20 @@ auth as the UI (basic auth, or `?token=`).
 | `GET /stream/{msg_id}` | Stream/download the original (supports range requests) |
 | `POST /api/upload` | Multipart upload from the browser |
 | `POST /api/ingest-url` | Server-side fetch of remote URLs (below) |
+| `DELETE /api/media/{msg_id}` | Delete an asset — channel copy, index row, caches (below) |
+
+### Deleting an asset
+
+`DELETE /api/media/{msg_id}` removes the Telegram message, the index row, its
+album memberships, and any cached thumbnail or bytes. The channel copy goes
+first: if Telegram refuses, the row is kept and the call returns `502` rather
+than leaving an untracked file in the channel. A message Telegram no longer has
+counts as deleted.
+
+| Query param | Effect |
+| --- | --- |
+| `force=true` | Drop the index row even if the channel copy could not be removed |
+| `keep_remote=true` | Only forget the asset here; leave the channel copy alone |
 
 ### Importing from remote URLs
 

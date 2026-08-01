@@ -96,6 +96,12 @@ VIEWER_TOKEN = os.environ.get("TG_STORE_TOKEN", "")
 THUMBS_DIR = Path(os.environ.get("TG_STORE_THUMBS", "cache/thumbs"))
 THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _thumb_path(msg_id: int) -> Path:
+    """Where the derived thumbnail for *msg_id* is cached."""
+    key = base64.urlsafe_b64encode(str(msg_id).encode()).decode().rstrip("=")
+    return THUMBS_DIR / f"{key}.jpg"
+
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 # ---------------------------------------------------------------------------
@@ -396,6 +402,100 @@ def api_media(
     return {"items": items, "total": total, "scanning": False}
 
 
+@app.delete("/api/media/{msg_id}")
+def api_delete_media(
+    msg_id: int,
+    force: bool = False,
+    keep_remote: bool = False,
+    _auth: bool = Depends(_require_auth),
+):
+    """Delete an asset: the Telegram message, the index row, and its caches.
+
+    The channel copy goes first. If Telegram refuses (permissions, transport)
+    the index row is kept so the asset does not become an untracked file in the
+    channel — pass ``force=true`` to drop the row anyway. A message Telegram no
+    longer has counts as deleted: the caller's goal is already met.
+
+    Query params:
+      ``keep_remote`` — only forget the asset here, leave the channel copy.
+      ``force``       — delete the row even if the channel copy could not be.
+    """
+    conn = _db()
+    row = conn.execute(
+        "SELECT id, filename FROM assets WHERE telegram_message_id = ?", (msg_id,)
+    ).fetchone()
+    if row is None:
+        conn.close()
+        raise HTTPException(404, detail="unknown asset")
+
+    asset_id = row["id"]
+    filename = row["filename"] or ""
+
+    if keep_remote:
+        remote: dict[str, Any] = {"deleted": False, "reason": "keep_remote"}
+    else:
+        remote = _delete_telegram_message(msg_id)
+        if not remote["deleted"] and not force:
+            conn.close()
+            raise HTTPException(
+                502, detail=f"Telegram delete failed: {remote.get('reason', 'unknown')}"
+            )
+
+    try:
+        conn.execute("DELETE FROM album_assets WHERE asset_id = ?", (asset_id,))
+        conn.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    _forget_media_files(msg_id)
+
+    with INDEX_LOCK:
+        before = len(MEDIA_INDEX)
+        MEDIA_INDEX[:] = [it for it in MEDIA_INDEX if it.get("msg_id") != msg_id]
+        changed = len(MEDIA_INDEX) != before
+    if changed:
+        _save_json_index()
+
+    logger.info("deleted asset %s (msg %s)", filename or asset_id, msg_id)
+    return {"ok": True, "msg_id": msg_id, "filename": filename, "telegram": remote}
+
+
+def _delete_telegram_message(msg_id: int) -> dict:
+    """Remove the channel copy. Never raises — the outcome is the return value."""
+    if not (BOT_TOKEN and CHANNEL_ID):
+        return {"deleted": False, "reason": "BOT_TOKEN/CHANNEL_ID not configured"}
+    try:
+        response = requests.post(
+            f"{_tg_base()}/deleteMessage",
+            json={"chat_id": CHANNEL_ID, "message_id": msg_id},
+            timeout=30,
+        )
+        body = response.json()
+    except Exception as exc:
+        logger.warning("deleteMessage transport error for %s", msg_id, exc_info=True)
+        return {"deleted": False, "reason": str(exc)}
+
+    if body.get("ok"):
+        return {"deleted": True}
+
+    description = str(body.get("description", ""))
+    # Already gone upstream — the asset is deleted as far as anyone can tell.
+    if "message to delete not found" in description.lower():
+        return {"deleted": True, "reason": "already absent"}
+    logger.warning("deleteMessage refused for %s: %s", msg_id, description)
+    return {"deleted": False, "reason": description or f"HTTP {response.status_code}"}
+
+
+def _forget_media_files(msg_id: int) -> None:
+    """Drop the cached bytes and thumbnail so a re-added id cannot serve them."""
+    for path in (_thumb_path(msg_id), _cache_path(msg_id)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove %s", path, exc_info=True)
+
+
 @app.get("/api/albums")
 def api_albums(_auth: bool = Depends(_require_auth)):
     conn = _db()
@@ -430,8 +530,7 @@ def thumb(msg_id: int, _auth: bool = Depends(_require_auth)):
     if not row:
         raise HTTPException(404)
 
-    thumb_key = base64.urlsafe_b64encode(str(msg_id).encode()).decode().rstrip("=")
-    thumb_path = THUMBS_DIR / f"{thumb_key}.jpg"
+    thumb_path = _thumb_path(msg_id)
 
     if thumb_path.exists() and thumb_path.stat().st_size > 0:
         return Response(thumb_path.read_bytes(), media_type="image/jpeg")
