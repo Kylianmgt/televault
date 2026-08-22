@@ -147,6 +147,33 @@ class TestApiMedia:
         assert data["total"] == 3
 
 
+class TestApiMediaById:
+    def test_get_existing(self, client: TestClient) -> None:
+        r = client.get("/api/media/101")
+        assert r.status_code == 200
+        item = r.json()
+        assert item["msg_id"] == 101
+        assert item["title"] == "photo1.jpg"
+        assert item["type"] == "photo"
+        # Same shape as a /api/media list item.
+        list_item = client.get("/api/media?q=photo").json()["items"][0]
+        assert set(item.keys()) == set(list_item.keys())
+
+    def test_get_video_kind(self, client: TestClient) -> None:
+        r = client.get("/api/media/102")
+        assert r.status_code == 200
+        assert r.json()["type"] == "video"
+
+    def test_unknown_id_404(self, client: TestClient) -> None:
+        r = client.get("/api/media/999999")
+        assert r.status_code == 404
+
+    def test_non_numeric_id_unprocessable(self, client: TestClient) -> None:
+        # Path param is typed int; a garbage id must not 500.
+        r = client.get("/api/media/notanumber")
+        assert r.status_code == 422
+
+
 class TestApiAlbums:
     def test_albums(self, client: TestClient) -> None:
         r = client.get("/api/albums")

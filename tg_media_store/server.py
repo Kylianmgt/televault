@@ -402,6 +402,67 @@ def api_media(
     return {"items": items, "total": total, "scanning": False}
 
 
+@app.get("/api/media/{msg_id}")
+def api_media_by_id(
+    msg_id: int,
+    _auth: bool = Depends(_require_auth),
+):
+    """One asset by Telegram message id — same shape as a /api/media item.
+
+    The list endpoint pages; callers that already hold the id (favorites,
+    detail views, deep links) should not pay for a full scan to resolve it.
+    """
+    conn = _db()
+    row = conn.execute(
+        "SELECT * FROM assets WHERE telegram_message_id = ?", (msg_id,)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        raise HTTPException(404, detail="unknown asset")
+
+    mime = row["mime_type"] or ""
+    fname = row["filename"] or ""
+    ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+
+    if mime.startswith("video/"):
+        media_type = "video"
+    elif mime == "image/gif":
+        media_type = "animation"
+    elif mime.startswith("image/"):
+        media_type = "photo"
+    elif mime.startswith("audio/"):
+        media_type = "audio"
+    elif mime == "application/pdf" or ext in ("doc", "docx", "xls", "xlsx",
+            "ppt", "pptx", "odt", "ods", "odp", "rtf", "txt", "csv", "md"):
+        media_type = "document"
+    elif ext in ("zip", "tar", "gz", "bz2", "xz", "rar", "7z", "iso", "tgz"):
+        media_type = "archive"
+    elif ext in ("py", "js", "ts", "html", "css", "java", "c", "cpp", "go",
+            "rs", "rb", "php", "sh", "sql", "json", "xml", "yaml", "yml",
+            "toml", "ini", "cfg"):
+        media_type = "code"
+    else:
+        media_type = "other"
+
+    try:
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+    except (TypeError, ValueError):
+        meta = {}
+
+    return {
+        "msg_id": row["telegram_message_id"],
+        "file_id": row["telegram_file_id"],
+        "title": fname,
+        "mime": mime,
+        "type": media_type,
+        "ext": ext,
+        "size": row["file_size"],
+        "uploaded_at": row["uploaded_at"] or "",
+        "caption": "",
+        "metadata": meta,
+    }
+
+
 @app.delete("/api/media/{msg_id}")
 def api_delete_media(
     msg_id: int,
